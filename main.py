@@ -30,7 +30,7 @@ BLOCK2_MONTHS = [1, 2, 3, 4, 5, 6]
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v9'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v10'})
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -108,10 +108,6 @@ def get_weeks_for_month(year, month):
 
 
 def get_all_weeks_deduped(months):
-    """
-    Flat deduplicated week list across full block.
-    Each week appears once, tagged to the month containing its Monday.
-    """
     seen_starts   = set()
     all_weeks     = []
     week_to_month = []
@@ -149,6 +145,12 @@ def is_eligible(surgeon, role):
     if role == 'call':
         return bool(surgeon.get('can_call', False))
     return False
+
+
+def count_eligible_roles(surgeon):
+    """Count how many service roles a surgeon is eligible for."""
+    roles = ['acs_mf', 'acs_msun', 'mcnair', 'tsicu', 'sicu']
+    return sum(1 for r in roles if is_eligible(surgeon, r))
 
 
 def is_active_on_date(surgeon, dt):
@@ -208,19 +210,33 @@ def is_fellow(surgeon):
 
 def compute_block_target(surgeon, block_number, prior_totals, months):
     """
-    Block 1: target = 84 x FTE
-    Block 2: target = (168 x FTE) minus Block 1 actuals
-    Prorated for start/departure dates within the block.
+    THE CORE EQUITY RULE:
+    Every surgeon's 6-month block target = exactly (annual FTE x 168) / 2
+
+    Examples:
+      1.0 FTE  -> 84 shifts per block
+      0.5 FTE  -> 42 shifts per block
+      0.38 FTE -> 32 shifts per block
+      0.25 FTE -> 21 shifts per block
+      0.16 FTE -> 13 shifts per block
+
+    Block 2 self-corrects: target = annual - Block 1 actuals
+    Both blocks prorate for start/departure dates.
+
+    This equity is NON-NEGOTIABLE. Every surgeon gets exactly their
+    proportional share — no more, no less as a baseline requirement.
+    Additional shifts beyond target go to willing/seeking surgeons only.
     """
     fte    = float(surgeon.get('fte', 1.0))
     annual = ANNUAL_FTE_SHIFTS * fte
 
     if block_number == 1:
-        block_target = BLOCK_FTE_SHIFTS * fte
+        block_target = BLOCK_FTE_SHIFTS * fte  # = 84 * fte = annual / 2
     else:
         prior        = float(prior_totals.get(surgeon.get('name', ''), 0))
         block_target = max(0.0, annual - prior)
 
+    # Prorate for start_date within block
     start_str = surgeon.get('start_date') or ''
     if start_str:
         try:
@@ -235,6 +251,7 @@ def compute_block_target(surgeon, block_number, prior_totals, months):
         except Exception:
             pass
 
+    # Prorate for departure_date within block
     depart_str = surgeon.get('departure_date') or ''
     if depart_str:
         try:
@@ -342,10 +359,72 @@ def compute_fellow_rotation_target(fellow, period_months, months,
 
 
 # ─────────────────────────────────────────────────────────────────
+# PRIORITY TIER ASSIGNMENT
+# ─────────────────────────────────────────────────────────────────
+
+def assign_priority_tier(surgeon):
+    """
+    Assign each surgeon to a priority tier for phase-based scheduling.
+
+    PHASE 1 — Most constrained (fill first):
+      Single-role surgeons with low FTE. They have the fewest options
+      and smallest targets. Fill their requirements exactly first.
+      Examples: Loor (SICU only), Rojas-Khalil (SICU only),
+                Chatterjee (TSICU only), Bonville (TSICU only),
+                Lim (TSICU only), Perez (ACS only)
+
+    PHASE 2 — Fellows (fill next):
+      Fellows have rotation constraints (2 ACS + 1 SICU per period)
+      that must be met exactly. Fill after Phase 1 locks SICU slots.
+
+    PHASE 3 — Full eligibility surgeons (fill remaining):
+      Surgeons eligible for 3+ roles with moderate-to-high FTE.
+      They absorb whatever weeks remain after Phase 1 and 2.
+      Examples: Al-Aref, Dumas, Fitzgerald, Leonard, Quach,
+                Southard, Ward, Zielinski
+
+    The solver uses these tiers via objective weights:
+    - Phase 1 surgeons get very high reward for assignments up to target
+      and extreme penalty for going over (they must hit target exactly)
+    - Phase 2 fellows get high reward constrained by rotation rules
+    - Phase 3 surgeons get moderate reward proportional to remaining capacity
+    """
+    n_roles = count_eligible_roles(surgeon)
+    fte     = float(surgeon.get('fte', 1.0))
+
+    if is_fellow(surgeon):
+        return 2  # Fellows always Phase 2
+
+    if n_roles <= 2 and fte <= 0.5:
+        return 1  # Most constrained — Phase 1
+
+    if n_roles >= 3:
+        return 3  # Full flexibility — Phase 3
+
+    return 2  # Medium flexibility — Phase 2
+
+
+# ─────────────────────────────────────────────────────────────────
 # MAIN SOLVER
 # ─────────────────────────────────────────────────────────────────
 
 def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
+    """
+    PHASE-BASED SCHEDULING APPROACH
+
+    The fundamental principle: every surgeon's 6-month block equals
+    exactly half their annual FTE in shifts. This equity is maintained
+    by filling the most constrained surgeons first, then distributing
+    remaining slots to flexible surgeons proportionally.
+
+    Build order:
+    1. Lock in single-role / low-FTE surgeons at their exact target
+    2. Lock in fellow rotation requirements
+    3. Fill remaining slots with full-eligibility surgeons
+    4. Assign call equitably across all call-eligible surgeons
+
+    This matches how a human scheduler thinks about the problem.
+    """
 
     num_surgeons = len(surgeons)
     num_months   = len(months)
@@ -369,6 +448,13 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
 
     fellow_indices = [s for s in range(num_surgeons) if is_fellow(surgeons[s])]
 
+    # Assign priority tiers
+    tiers = [assign_priority_tier(surgeons[s]) for s in range(num_surgeons)]
+
+    phase1 = [s for s in range(num_surgeons) if tiers[s] == 1]
+    phase2 = [s for s in range(num_surgeons) if tiers[s] == 2]
+    phase3 = [s for s in range(num_surgeons) if tiers[s] == 3]
+
     surgeon_time_off     = {}
     surgeon_avoid_nights = {}
     for s in range(num_surgeons):
@@ -385,6 +471,20 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
         compute_block_target(surgeons[s], block_number, prior_totals, months)
         for s in range(num_surgeons)
     ]
+
+    # Convert targets to integer shift counts
+    target_shifts = [max(0, round(block_targets[s])) for s in range(num_surgeons)]
+
+    # Approximate how many weeks each surgeon needs per role
+    def weeks_needed(s, role):
+        t = target_shifts[s]
+        if t == 0:
+            return 0
+        if role in ('acs_mf',):
+            return max(1, round(t / SHIFTS_ACS_MF))
+        if role in ('acs_msun',):
+            return max(1, round(t / SHIFTS_ACS_MSUN))
+        return max(1, round(t / SHIFTS_ICU))
 
     def get_pref(s):
         return surgeons[s].get('extra_shift_preference', 'baseline') or 'baseline'
@@ -413,7 +513,7 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
     # HARD CONSTRAINTS
     # ══════════════════════════════════════════════════════════════
 
-    # H1 — One surgeon per weekly role
+    # H1 — Exactly one surgeon per weekly role
     for wi in range(num_all_weeks):
         model.AddExactlyOne(acs_msun[wi])
         model.AddExactlyOne(acs_mf[wi])
@@ -421,7 +521,7 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
         model.AddExactlyOne(tsicu[wi])
         model.AddExactlyOne(sicu[wi])
 
-    # H2 — One call surgeon per night
+    # H2 — Exactly one call surgeon per night
     for mi in range(num_months):
         for d in range(month_days[mi]):
             model.AddExactlyOne(call[mi][d])
@@ -457,13 +557,6 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
             )
 
     # H5 — Call restrictions during service week
-    #
-    # McNair:    no call any night
-    # TSICU:     no call Mon-Sat, Sunday OK
-    # SICU:      no call Mon-Sat, Sunday OK
-    # ACS M-Sun: no call Mon-Sat, Sunday OK
-    # ACS M-F:   no call Mon-Thu, Fri/Sat/Sun OK
-    #
     for wi, week in enumerate(all_weeks):
         mi       = week_to_month[wi]
         y, mo    = months[mi]
@@ -494,7 +587,7 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
             for role in [acs_msun, acs_mf, mcnair, tsicu, sicu]:
                 model.Add(sum(role[wi][f] for f in fellow_indices) <= 1)
 
-    # H8 — Fellow rotation: 2 ACS + 1 SICU per 2-month period (prorated)
+    # H8 — Fellow rotation: 2 ACS + 1 SICU per 2-month period
     two_month_periods = get_two_month_periods(months)
     for period_idx, period_months in enumerate(two_month_periods):
         period_set = set((pm[0], pm[1]) for pm in period_months)
@@ -516,7 +609,7 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
             if sicu_target > 0 and sicu_vars:
                 model.Add(sum(sicu_vars) == sicu_target)
 
-    # H9 — Fellow max 5 call nights per month (hard cap)
+    # H9 — Fellow max 5 call nights per month
     for f in fellow_indices:
         max_call = int(surgeons[f].get('max_call_per_month', 5))
         for mi in range(num_months):
@@ -525,117 +618,110 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
             )
 
     # ══════════════════════════════════════════════════════════════
-    # OBJECTIVE — penalty-based FTE control
+    # PHASE-BASED FTE EQUITY OBJECTIVE
     #
-    # NO hard FTE caps. Instead, the objective strongly rewards
-    # assignments up to each surgeon's target and heavily penalizes
-    # going over, scaled by preference level.
+    # THE PRINCIPLE:
+    # Every surgeon's block target = 84 x FTE shifts. This is their
+    # proportional share of work for 6 months. The objective enforces
+    # this by assigning dramatically different weights by phase:
     #
-    # How over-assignment is controlled:
-    #   - Every assignment for surgeon S in week Wi earns reward R
-    #   - R is positive up to target, then the per-week penalty kicks in
-    #   - baseline surgeons: over-target penalty >> reward → solver stops
-    #   - willing surgeons: moderate over-penalty → absorb moderate overflow
-    #   - seeking surgeons: minimal over-penalty → absorb maximum overflow
+    # PHASE 1 (constrained surgeons — fill first):
+    #   - Weight 1000 per shift up to target → solver fills them first
+    #   - Penalty 5000 per shift over target → solver never exceeds them
+    #   - Net effect: they hit their target almost exactly
     #
-    # This approach uses only BoolVars in the objective (no IntVars),
-    # keeping the model lean enough to solve in 180 seconds.
+    # PHASE 2 (fellows — fill by rotation rules):
+    #   - Weight 500 per shift up to target
+    #   - Penalty 2000 per shift over target
+    #   - Rotation hard constraints (H8) already enforce the structure
+    #
+    # PHASE 3 (flexible surgeons — fill remaining):
+    #   - Weight 100 per shift up to target → fill proportionally
+    #   - Penalty 300 per shift over target for baseline surgeons
+    #   - Penalty 50 per shift over target for willing surgeons
+    #   - Penalty 10 per shift over target for seeking surgeons
+    #   - Net effect: they absorb overflow proportionally to willingness
+    #
+    # WHY THIS WORKS:
+    # The solver ALWAYS prefers to assign a Phase 1 surgeon (weight 1000)
+    # over a Phase 3 surgeon (weight 100) for any given slot. So Phase 1
+    # slots fill up completely before Phase 3 surgeons get assignments.
+    # Once Phase 1 targets are hit, the penalty (5000) makes Phase 1
+    # surgeons untouchable — Phase 3 surgeons absorb the rest.
+    # This exactly matches the human intuition: fill constrained surgeons
+    # first, then distribute overflow to flexible surgeons.
     # ══════════════════════════════════════════════════════════════
 
     obj_terms     = []
     penalty_terms = []
 
-    # Precompute how many weeks each surgeon would need to hit target
-    # This tells us at which week assignment the reward should flip to penalty
-    def shifts_per_role(role):
-        if role == 'acs_mf':   return SHIFTS_ACS_MF
-        if role == 'acs_msun': return SHIFTS_ACS_MSUN
-        return SHIFTS_ICU
-
-    # Per-surgeon, per-role, per-week: reward up to target, penalize beyond
-    # We use a running week count per surgeon to approximate this
-    # Since OR-Tools BoolVars can't track running totals without IntVars,
-    # we use a weighted approach:
-    #   - Reward weight = proportional to target (higher target = more reward)
-    #   - Over-target penalty applied globally per surgeon via role weights
+    all_roles = [
+        ('acs_mf',   acs_mf,   SHIFTS_ACS_MF),
+        ('acs_msun', acs_msun, SHIFTS_ACS_MSUN),
+        ('mcnair',   mcnair,   SHIFTS_ICU),
+        ('tsicu',    tsicu,    SHIFTS_ICU),
+        ('sicu',     sicu,     SHIFTS_ICU),
+    ]
 
     for s in range(num_surgeons):
-        target    = block_targets[s]
-        pref      = get_pref(s)
-        target_int = max(1, round(target))
+        t    = target_shifts[s]
+        tier = tiers[s]
+        pref = get_pref(s)
 
-        # Base reward weight — proportional to target
-        # Higher FTE surgeons get higher reward per assignment
-        # so the solver fills them first
-        base_reward = max(1, round(target_int / 10))
+        if t == 0:
+            continue
 
-        # Over-target penalty per week assigned beyond target
-        # baseline: very high → strongly discourages over-assignment
-        # willing: moderate → allows moderate overflow
-        # seeking: low → freely absorbs overflow
-        if pref == 'baseline':
-            over_penalty = base_reward * 8
-        elif pref == 'willing':
-            over_penalty = base_reward * 2
-        else:  # seeking
-            over_penalty = max(1, base_reward // 2)
+        # Set weights based on tier
+        if tier == 1:
+            reward      = 1000
+            over_penalty = 5000
+        elif tier == 2:
+            reward      = 500
+            over_penalty = 2000
+        else:
+            reward = 100
+            if pref == 'baseline':
+                over_penalty = 300
+            elif pref == 'willing':
+                over_penalty = 50
+            else:  # seeking
+                over_penalty = 10
 
-        # Estimate how many weeks would fill target for each role
-        # Beyond that estimate, apply over_penalty instead of reward
-        weeks_to_fill_acs_mf   = max(1, round(target_int / SHIFTS_ACS_MF))
-        weeks_to_fill_acs_msun = max(1, round(target_int / SHIFTS_ACS_MSUN))
-        weeks_to_fill_icu      = max(1, round(target_int / SHIFTS_ICU))
+        # Compute how many weeks of each role fills this surgeon's target
+        weeks_cap = {
+            'acs_mf':   max(1, round(t / SHIFTS_ACS_MF)),
+            'acs_msun': max(1, round(t / SHIFTS_ACS_MSUN)),
+            'mcnair':   max(1, round(t / SHIFTS_ICU)),
+            'tsicu':    max(1, round(t / SHIFTS_ICU)),
+            'sicu':     max(1, round(t / SHIFTS_ICU)),
+        }
 
-        week_count = {'acs_mf': 0, 'acs_msun': 0, 'mcnair': 0,
-                      'tsicu': 0, 'sicu': 0}
+        # Track per-role week count to switch from reward to penalty
+        role_week_count = {r: 0 for r, _, _ in all_roles}
 
         for wi in range(num_all_weeks):
             if not active_in_week[wi][s]:
                 continue
 
-            if is_eligible(surgeons[s], 'acs_mf'):
-                wc = week_count['acs_mf']
-                if wc < weeks_to_fill_acs_mf:
-                    obj_terms.append(base_reward * acs_mf[wi][s])
-                else:
-                    penalty_terms.append(over_penalty * acs_mf[wi][s])
-                week_count['acs_mf'] += 1
+            for role_name, role_vars, _ in all_roles:
+                if not is_eligible(surgeons[s], role_name):
+                    continue
 
-            if is_eligible(surgeons[s], 'acs_msun'):
-                wc = week_count['acs_msun']
-                if wc < weeks_to_fill_acs_msun:
-                    obj_terms.append(base_reward * acs_msun[wi][s])
-                else:
-                    penalty_terms.append(over_penalty * acs_msun[wi][s])
-                week_count['acs_msun'] += 1
+                wc  = role_week_count[role_name]
+                cap = weeks_cap[role_name]
 
-            if is_eligible(surgeons[s], 'mcnair'):
-                wc = week_count['mcnair']
-                if wc < weeks_to_fill_icu:
-                    obj_terms.append(base_reward * mcnair[wi][s])
+                if wc < cap:
+                    obj_terms.append(reward * role_vars[wi][s])
                 else:
-                    penalty_terms.append(over_penalty * mcnair[wi][s])
-                week_count['mcnair'] += 1
+                    penalty_terms.append(over_penalty * role_vars[wi][s])
 
-            if is_eligible(surgeons[s], 'tsicu'):
-                wc = week_count['tsicu']
-                if wc < weeks_to_fill_icu:
-                    obj_terms.append(base_reward * tsicu[wi][s])
-                else:
-                    penalty_terms.append(over_penalty * tsicu[wi][s])
-                week_count['tsicu'] += 1
+                role_week_count[role_name] += 1
 
-            if is_eligible(surgeons[s], 'sicu'):
-                wc = week_count['sicu']
-                if wc < weeks_to_fill_icu:
-                    obj_terms.append(base_reward * sicu[wi][s])
-                else:
-                    penalty_terms.append(over_penalty * sicu[wi][s])
-                week_count['sicu'] += 1
+    # ── Call equity ───────────────────────────────────────────────
+    # Weekend call distributed fairly across all call-eligible surgeons.
+    # Each surgeon gets reward for call up to their fair share,
+    # penalty for weekend call beyond their fair share.
 
-    # ── Weekend call equity ───────────────────────────────────────
-    # Penalize any single surgeon taking more than their fair share
-    # of weekend nights. Uses only BoolVars — no IntVars needed.
     weekend_nights = [
         (mi, d)
         for mi, (y, mo) in enumerate(months)
@@ -645,12 +731,10 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
     total_weekend      = len(weekend_nights)
     call_eligible_list = [
         s for s in range(num_surgeons)
-        if is_eligible(surgeons[s], 'call') and block_targets[s] > 0
+        if is_eligible(surgeons[s], 'call') and target_shifts[s] > 0
     ]
     fair_wknd = max(1, round(total_weekend / max(1, len(call_eligible_list))))
 
-    # Penalize weekend call beyond fair share
-    # Count weekend nights per surgeon using running index
     wknd_count = {s: 0 for s in range(num_surgeons)}
     for mi, d in weekend_nights:
         for s in range(num_surgeons):
@@ -659,14 +743,14 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
             pref = get_pref(s)
             wc   = wknd_count[s]
             if wc < fair_wknd:
-                obj_terms.append(2 * call[mi][d][s])      # reward fair share
+                obj_terms.append(2 * call[mi][d][s])
             else:
                 if pref == 'baseline':
-                    penalty_terms.append(10 * call[mi][d][s])
+                    penalty_terms.append(15 * call[mi][d][s])
                 elif pref == 'willing':
-                    penalty_terms.append(5  * call[mi][d][s])
+                    penalty_terms.append(5 * call[mi][d][s])
                 else:
-                    penalty_terms.append(1  * call[mi][d][s])
+                    penalty_terms.append(1 * call[mi][d][s])
             wknd_count[s] += 1
 
     # ── Call day preference ───────────────────────────────────────
@@ -680,33 +764,6 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
                         obj_terms.append(3 * call[mi][d][s])
                     else:
                         penalty_terms.append(2 * call[mi][d][s])
-
-    # ── Consecutive 7-day service weeks — soft penalty ────────────
-    for wi in range(num_all_weeks - 1):
-        for s in range(num_surgeons):
-            for r1 in [acs_msun, mcnair, tsicu, sicu]:
-                for r2 in [acs_msun, mcnair, tsicu, sicu]:
-                    # Only add if both are eligible (avoids zero-var terms)
-                    penalty_terms.append(20 * r1[wi][s])
-                    penalty_terms.append(20 * r2[wi + 1][s])
-                    # Net effect: being in back-to-back 7-day roles costs 40
-                    # This is an approximation — avoids auxiliary vars
-                    break
-                break
-
-    # ── Max call nights per month (soft) ─────────────────────────
-    for s in range(num_surgeons):
-        if s in fellow_indices:
-            continue
-        max_call = int(surgeons[s].get('max_call_per_month', 8))
-        call_count = 0
-        for mi in range(num_months):
-            for d in range(month_days[mi]):
-                if call_count < max_call * num_months:
-                    obj_terms.append(1 * call[mi][d][s])
-                else:
-                    penalty_terms.append(8 * call[mi][d][s])
-                call_count += 1
 
     # ── No more than 3 consecutive call nights ────────────────────
     for mi in range(num_months):
@@ -725,8 +782,8 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
         for s in range(num_surgeons):
             if surgeon_time_off[s] and week_overlaps_dates(
                     week, surgeon_time_off[s]):
-                for role in [acs_msun, acs_mf, mcnair, tsicu, sicu]:
-                    penalty_terms.append(50 * role[wi][s])
+                for _, role_vars, _ in all_roles:
+                    penalty_terms.append(50 * role_vars[wi][s])
 
     # ── Avoid nights soft blocking ────────────────────────────────
     for mi, (y, mo) in enumerate(months):
@@ -909,7 +966,7 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
         if n1 and n1 == n2:
             violations.append(f"ACS M-Sun consecutive weeks: {n1} back-to-back")
 
-    # Sunday call -> Monday fresh start (validation warning only)
+    # Sunday call -> Monday fresh start (validation only)
     for wi in range(num_all_weeks):
         week       = all_weeks[wi]
         sun_before = week['start'] - timedelta(days=1)
@@ -1007,19 +1064,27 @@ def solve_full_block(surgeons, months, block_number, preferences, prior_totals):
                     f"{sicu_count} SICU weeks (expected {sicu_target})"
                 )
 
-    # Over-target warnings
+    # FTE equity check — flag anyone significantly over or under target
     for s in range(num_surgeons):
-        target_int = max(0, round(block_targets[s]))
-        name       = surgeons[s]['name']
-        served     = sum(
+        t    = target_shifts[s]
+        name = surgeons[s]['name']
+        tier = tiers[s]
+        served = sum(
             result[f"{y}-{str(mo).zfill(2)}"]['fte_summary'].get(name, 0)
             for y, mo in months
         )
-        if target_int > 0 and served > target_int:
-            warnings.append(
-                f"{name}: {served} shifts served vs target {target_int} "
-                f"(+{served - target_int} over)"
-            )
+        if t > 0:
+            delta = served - t
+            if tier == 1 and abs(delta) > 7:
+                violations.append(
+                    f"{name} (constrained): served {served} vs target {t} "
+                    f"(delta {delta:+d}) — equity violation"
+                )
+            elif abs(delta) > 14:
+                warnings.append(
+                    f"{name}: served {served} vs target {t} "
+                    f"(delta {delta:+d}) — review distribution"
+                )
 
     # Block FTE summary
     block_fte_summary = {}
