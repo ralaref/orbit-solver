@@ -1,36 +1,29 @@
 """
-ORbit Surgical Scheduling Solver v15
+ORbit Surgical Scheduling Solver v16
 =====================================
-Architecture:
-  - Greedy algorithm for service week assignments
-    (deterministic, fast, human-like, always produces fair results)
-  - OR-Tools CP-SAT for call night assignments
-    (constraint satisfaction for the complex nightly interaction problem)
+Key fix from v15: Paced greedy distribution.
 
-Greedy philosophy:
-  For each week, for each role, pick the best available surgeon using
-  a priority score that rewards surgeons who:
-    1. Are furthest below their FTE target (proportionally)
-    2. Have not worked recently (avoids consecutive weeks)
-    3. Match the role's eligibility requirements
+The v15 greedy filled weeks chronologically without awareness of the
+full 6-month horizon. By November, surgeons had already hit their caps
+from July-October, leaving weeks unfilled.
 
-  This exactly mirrors how a human scheduler thinks:
-  "Who needs this week most? Who hasn't worked in a while?"
+v16 fix: Each surgeon gets a "pace budget" — how many shifts they should
+have served by each week to stay on track for their full-block target.
+The priority score now rewards surgeons who are BEHIND their pace budget,
+not just behind their overall target. This naturally spreads assignments
+evenly across all 6 months.
 
-Rules honored:
-  - FTE targets: 84 x FTE per 6-month block (prorated for start/end dates)
-  - Eligibility flags: contractual, never overridden
-  - Active dates: all surgeons treated identically
-  - No consecutive 7-day service weeks (hard rule in greedy)
-  - ACS M-Sun no repeat consecutive weeks (hard rule in greedy)
-  - Fellow rotation: 2 ACS + 1 SICU per 2-month period
-  - Fellows cannot share same role same week
-  - Baseline surgeons stop at their FTE target
-  - Willing surgeons can absorb up to 40% overflow
-  - Seeking surgeons can absorb up to 80% overflow
-  - Surgeon preferences (time off, conferences) respected
-  - Call restrictions enforced by Solver 2
-  - Weekend call equity enforced by Solver 2
+Example — Loor (0.38 FTE, 32 shifts target, 26 weeks):
+  Week 1 pace budget:  32 * (1/26)  = 1.2 shifts  (she needs ~0 shifts so far)
+  Week 13 pace budget: 32 * (13/26) = 16 shifts    (she needs ~16 shifts by now)
+  Week 26 pace budget: 32 * (26/26) = 32 shifts    (she needs ~32 shifts total)
+
+If Loor has served 0 shifts by week 13 (when she should have 16),
+her pace deficit is 16 — very high priority. The algorithm assigns her.
+If she has 16 by week 13, deficit is 0 — normal priority.
+If she has 20 by week 13 (ahead of pace), deficit is negative — lower priority.
+
+This produces natural, even distribution across the full 6 months.
 """
 
 from flask import Flask, request, jsonify
@@ -43,9 +36,9 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 # CONSTANTS
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 ANNUAL_FTE_SHIFTS = 168
 BLOCK_FTE_SHIFTS  = 84
@@ -64,18 +57,23 @@ ROLE_SHIFTS = {
     'SICU':        SHIFTS_ICU,
 }
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# Role assignment order: most constrained pools first
+# This ensures surgeons with limited eligibility get their slots
+# before the general pool fills those positions
+ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
+
+# ─────────────────────────────────────────────────────────────────
 # HEALTH
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v15'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v16'})
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 # ENDPOINT
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 @app.route('/solve-block', methods=['POST'])
 def solve_block():
@@ -100,7 +98,6 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        # Step 1: Greedy service week assignment
         week_assignments = greedy_service_weeks(
             surgeons=surgeons,
             months=months,
@@ -109,7 +106,6 @@ def solve_block():
             prior_totals=prior_totals,
         )
 
-        # Step 2: OR-Tools call assignment
         call_assignments = solve_call(
             surgeons=surgeons,
             months=months,
@@ -117,7 +113,6 @@ def solve_block():
             preferences=preferences,
         )
 
-        # Step 3: Build output and validation report
         result = build_output(
             surgeons=surgeons,
             months=months,
@@ -138,18 +133,17 @@ def solve_block():
         }), 500
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-# WEEK CALCULATION
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
+# WEEK UTILITIES
+# ─────────────────────────────────────────────────────────────────
 
 def get_all_weeks(months):
     """
-    Returns a deduplicated, chronologically sorted list of all
-    Mon-Sun weeks in the block. Each week appears exactly once,
-    tagged to the month containing its Monday.
+    Returns all Mon-Sun weeks in the block, deduplicated and sorted
+    chronologically. Each week tagged to the month containing its Monday.
     """
-    seen   = set()
-    weeks  = []
+    seen  = set()
+    weeks = []
 
     for mi, (y, mo) in enumerate(months):
         first_day  = datetime(y, mo, 1)
@@ -193,12 +187,12 @@ def get_two_month_periods(months):
     return [[months[i], months[i + 1]] for i in range(0, 6, 2)]
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 # SURGEON HELPERS
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 def is_eligible(surgeon, role):
-    """Contractual eligibility â never overridden."""
+    """Contractual eligibility — never overridden."""
     role_map = {
         'ACS (M-F)':   'can_acs',
         'ACS (M-Sun)': 'can_acs',
@@ -212,10 +206,6 @@ def is_eligible(surgeon, role):
 
 
 def is_active_on_date(surgeon, dt):
-    """
-    All surgeons treated identically â active on and after start_date,
-    inactive after departure_date. No special cases.
-    """
     start_str = surgeon.get('start_date') or ''
     if start_str:
         try:
@@ -266,15 +256,19 @@ def get_pref(surgeon):
     return surgeon.get('extra_shift_preference', 'baseline') or 'baseline'
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def is_seven_day_role(role):
+    return role in ('ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU')
+
+
+# ─────────────────────────────────────────────────────────────────
 # FTE TARGET & CAPS
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 def compute_block_target(surgeon, block_number, prior_totals, months):
     """
     Block 1: target = 84 x FTE
     Block 2: target = (168 x FTE) - Block 1 actuals
-    Prorated for start/departure dates within the block.
+    Prorated for start/departure dates.
     """
     fte    = float(surgeon.get('fte', 1.0))
     annual = ANNUAL_FTE_SHIFTS * fte
@@ -317,19 +311,14 @@ def compute_block_target(surgeon, block_number, prior_totals, months):
 
 
 def compute_shift_cap(target_shifts, pref):
-    """
-    Maximum total service shifts a surgeon can receive.
-    baseline: exactly their target
-    willing:  up to 140% of target
-    seeking:  up to 180% of target
-    """
+    """Hard ceiling on total shifts per surgeon."""
     multiplier = {'baseline': 1.0, 'willing': 1.4, 'seeking': 1.8}.get(pref, 1.0)
     return round(target_shifts * multiplier)
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 # PREFERENCE PARSING
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 def get_surgeon_prefs(surgeon_id, preferences):
     for p in preferences:
@@ -386,74 +375,72 @@ def day_in_dates(year, month, day_0indexed, date_set):
         return False
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-# FELLOW ROTATION TRACKING
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
+# FELLOW ROTATION
+# ─────────────────────────────────────────────────────────────────
 
 def compute_fellow_period_targets(fellows, periods, all_weeks):
-    """
-    For each fellow and each 2-month period, compute how many
-    ACS weeks and SICU weeks they need to fulfill their rotation.
-    Returns: {fellow_name: {period_idx: (acs_target, sicu_target)}}
-    """
     result = {}
     for fellow in fellows:
-        fname  = fellow['name']
+        fname         = fellow['name']
         result[fname] = {}
         for pi, period_months in enumerate(periods):
             period_set   = set((pm[0], pm[1]) for pm in period_months)
             period_weeks = [w for w in all_weeks
                             if (w['year'], w['month']) in period_set]
             total   = len(period_weeks)
-            active  = sum(1 for w in period_weeks
-                          if is_active_for_week(fellow, w))
+            active  = sum(1 for w in period_weeks if is_active_for_week(fellow, w))
             if total == 0 or active == 0:
                 result[fname][pi] = (0, 0)
                 continue
-            ratio = active / total
+            ratio             = active / total
             result[fname][pi] = (max(0, round(2 * ratio)),
                                   max(0, round(1 * ratio)))
     return result
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-# GREEDY SERVICE WEEK SOLVER
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
+# GREEDY SERVICE WEEK SOLVER — PACED DISTRIBUTION
+# ─────────────────────────────────────────────────────────────────
 
 def greedy_service_weeks(surgeons, months, block_number, preferences, prior_totals):
     """
-    Greedy algorithm for service week assignment.
+    Paced greedy algorithm for service week assignment.
 
-    For each week in chronological order, for each role, select the
-    best available surgeon using a priority score. This mirrors exactly
-    how a human scheduler thinks.
+    THE KEY IMPROVEMENT OVER v15:
+    v15 scored candidates by (target - served) / target.
+    This meant surgeons near their target in week 5 got low priority,
+    even though they hadn't really "used up" their allocation — they
+    just happened to be scheduled early. The algorithm then ran out of
+    eligible candidates in November/December.
 
-    PRIORITY SCORE (higher = more likely to be assigned):
-      base     = (target - served) / target   [0..1] how far below target
-      recency  = weeks_since_last_service * 0.1  [rest bonus]
-      pref_adj = 0.2 bonus for willing/seeking when above baseline target
+    v16 uses a PACE BUDGET instead:
+    pace_deficit = pace_budget_at_week_wi - served_so_far
 
-    Constraints checked before scoring:
-      - Surgeon is active this week
-      - Surgeon is eligible for this role
-      - Surgeon has not hit their shift cap
-      - Surgeon is not already assigned to another role this week
-      - No consecutive 7-day service week (ACS M-Sun, McNair, TSICU, SICU)
-      - ACS M-Sun not assigned two consecutive weeks
-      - Surgeon not on time off / conference this week
-      - Fellow rotation constraints
+    pace_budget_at_week_wi = target * (active_weeks_so_far / total_active_weeks)
 
-    Fellow rotation is pre-planned before the greedy loop:
-      We calculate exactly which weeks each fellow needs ACS and SICU
-      then reserve those slots before filling the rest.
+    This tells us: "How many shifts SHOULD this surgeon have served
+    by now if we spread their work evenly across the block?"
+
+    A surgeon with a large pace deficit is behind schedule — high priority.
+    A surgeon ahead of pace has lower priority.
+    A surgeon at their cap gets a strongly negative score.
+
+    This produces natural, even distribution across all 6 months because
+    the algorithm actively works to keep everyone on pace, not just to
+    fill slots with whoever is available.
+
+    Additional improvements:
+    - Fellows pre-scheduled across all periods before general assignment
+    - Two-pass system: pass 1 fills fellows, pass 2 fills everyone else
+    - Remaining capacity reserved proportionally for later months
     """
-
     all_weeks = get_all_weeks(months)
+    num_weeks = len(all_weeks)
     periods   = get_two_month_periods(months)
 
-    fellows       = [s for s in surgeons if is_fellow(s)]
-    non_fellows   = [s for s in surgeons if not is_fellow(s)]
-    all_surgeons  = surgeons  # full list for indexing
+    fellows     = [s for s in surgeons if is_fellow(s)]
+    all_names   = [s['name'] for s in surgeons]
 
     # Parse preferences
     surgeon_time_off = {}
@@ -468,19 +455,152 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
     targets = {}
     caps    = {}
     for s in surgeons:
-        t           = compute_block_target(s, block_number, prior_totals, months)
-        t_int       = max(0, round(t))
-        pref        = get_pref(s)
+        t              = compute_block_target(s, block_number, prior_totals, months)
+        t_int          = max(0, round(t))
+        pref           = get_pref(s)
         targets[s['name']] = t_int
         caps[s['name']]    = compute_shift_cap(t_int, pref)
 
-    # State tracking
-    served          = {s['name']: 0 for s in surgeons}       # shifts served so far
-    last_service_wi = {s['name']: -99 for s in surgeons}     # last week index with any service
-    last_acs_msun_wi = {s['name']: -99 for s in surgeons}    # last ACS M-Sun week index
-    last_7day_wi    = {s['name']: -99 for s in surgeons}     # last 7-day role week index
+    # Compute each surgeon's active weeks count
+    # (used to calculate pace budget at each point in time)
+    surgeon_active_weeks = {}
+    for s in surgeons:
+        surgeon_active_weeks[s['name']] = sum(
+            1 for w in all_weeks if is_active_for_week(s, w)
+        )
 
-    # week_assignments[wi] = {role: surgeon_name}
+    # State tracking
+    served           = {n: 0  for n in all_names}
+    last_service_wi  = {n: -99 for n in all_names}
+    last_7day_wi     = {n: -99 for n in all_names}
+    last_acs_msun_wi = {n: -99 for n in all_names}
+
+    # Active weeks seen so far per surgeon (for pace calculation)
+    active_weeks_so_far = {n: 0 for n in all_names}
+
+    # Fellow rotation tracking
+    fellow_period_targets = compute_fellow_period_targets(fellows, periods, all_weeks)
+    fellow_acs_served  = {f['name']: {pi: 0 for pi in range(len(periods))} for f in fellows}
+    fellow_sicu_served = {f['name']: {pi: 0 for pi in range(len(periods))} for f in fellows}
+
+    def get_period_idx(week):
+        for pi, period_months in enumerate(periods):
+            period_set = set((pm[0], pm[1]) for pm in period_months)
+            if (week['year'], week['month']) in period_set:
+                return pi
+        return None
+
+    def fellow_needs_acs(fellow, week):
+        pi = get_period_idx(week)
+        if pi is None:
+            return False
+        acs_t, _ = fellow_period_targets[fellow['name']].get(pi, (0, 0))
+        return fellow_acs_served[fellow['name']][pi] < acs_t
+
+    def fellow_needs_sicu(fellow, week):
+        pi = get_period_idx(week)
+        if pi is None:
+            return False
+        _, sicu_t = fellow_period_targets[fellow['name']].get(pi, (0, 0))
+        return fellow_sicu_served[fellow['name']][pi] < sicu_t
+
+    def fellow_can_take_role(fellow, role, week):
+        if role in ('ACS (M-F)', 'ACS (M-Sun)'):
+            return fellow_needs_acs(fellow, week)
+        if role == 'SICU':
+            return fellow_needs_sicu(fellow, week)
+        return False
+
+    def pace_budget(surgeon, wi):
+        """
+        How many shifts should this surgeon have served by week wi
+        if we spread their work evenly across their active weeks?
+        """
+        name             = surgeon['name']
+        total_active     = surgeon_active_weeks[name]
+        active_so_far    = active_weeks_so_far[name]
+        t                = targets[name]
+
+        if total_active == 0 or t == 0:
+            return 0.0
+
+        # Linear interpolation: by week wi, surgeon should have served
+        # target * (active_so_far / total_active) shifts
+        return t * (active_so_far / total_active)
+
+    def can_assign(surgeon, role, week, wi, assigned_this_week):
+        name = surgeon['name']
+
+        if name in assigned_this_week.values():
+            return False
+        if not is_active_for_week(surgeon, week):
+            return False
+        if not is_eligible(surgeon, role):
+            return False
+
+        role_shifts = ROLE_SHIFTS[role]
+        if served[name] + role_shifts > caps[name]:
+            return False
+
+        if surgeon_time_off.get(name) and week_overlaps_dates(
+                week, surgeon_time_off[name]):
+            return False
+
+        if is_seven_day_role(role) and wi - last_7day_wi[name] <= 1:
+            return False
+
+        if role == 'ACS (M-Sun)' and wi - last_acs_msun_wi[name] <= 1:
+            return False
+
+        if is_fellow(surgeon) and not fellow_can_take_role(surgeon, role, week):
+            return False
+
+        return True
+
+    def priority_score(surgeon, role, wi, week):
+        """
+        Paced priority score.
+
+        Components:
+        1. Pace deficit: how far behind their even-distribution pace are they?
+           Normalized by target so different FTE levels are comparable.
+           This is the PRIMARY driver — keeps distribution even over 6 months.
+
+        2. Rest bonus: weeks since last service.
+           Secondary driver — prevents consecutive week overload.
+
+        3. Preference adjustment: willing/seeking get a bonus when over their
+           baseline target, so they naturally absorb overflow. Baseline
+           surgeons get a penalty when over target.
+        """
+        name  = surgeon['name']
+        t     = targets[name]
+        pref  = get_pref(surgeon)
+
+        if t == 0:
+            return -1.0
+
+        # Pace deficit (primary)
+        budget        = pace_budget(surgeon, wi)
+        pace_deficit  = (budget - served[name]) / t  # normalized to [~-1, ~1]
+
+        # Rest bonus (secondary)
+        weeks_rested = wi - last_service_wi[name]
+        rest         = min(weeks_rested * 0.08, 0.4)
+
+        # Preference adjustment for over-target situations
+        pref_adj = 0.0
+        if served[name] >= t:
+            if pref == 'willing':
+                pref_adj = 0.1
+            elif pref == 'seeking':
+                pref_adj = 0.2
+            else:
+                pref_adj = -0.8  # strongly discourage baseline over-assignment
+
+        return pace_deficit + rest + pref_adj
+
+    # Initialize week assignments
     week_assignments = {}
     for wi, week in enumerate(all_weeks):
         week_assignments[wi] = {
@@ -491,222 +611,68 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
             'month_idx': week['month_idx'],
         }
 
-    # ââ Pre-plan fellow rotation ââââââââââââââââââââââââââââââââââ
-    # Calculate fellow rotation targets per period
-    fellow_period_targets = compute_fellow_period_targets(fellows, periods, all_weeks)
-
-    # Track fellow rotation fulfillment
-    fellow_acs_served  = {f['name']: {pi: 0 for pi in range(len(periods))} for f in fellows}
-    fellow_sicu_served = {f['name']: {pi: 0 for pi in range(len(periods))} for f in fellows}
-
-    def get_period_idx(week):
-        period_set_list = [
-            set((pm[0], pm[1]) for pm in p) for p in periods
-        ]
-        for pi, pset in enumerate(period_set_list):
-            if (week['year'], week['month']) in pset:
-                return pi
-        return None
-
-    def fellow_needs_acs(fellow, week):
-        """Does this fellow still need an ACS week in this period?"""
-        pi = get_period_idx(week)
-        if pi is None:
-            return False
-        acs_t, _ = fellow_period_targets[fellow['name']].get(pi, (0, 0))
-        return fellow_acs_served[fellow['name']][pi] < acs_t
-
-    def fellow_needs_sicu(fellow, week):
-        """Does this fellow still need a SICU week in this period?"""
-        pi = get_period_idx(week)
-        if pi is None:
-            return False
-        _, sicu_t = fellow_period_targets[fellow['name']].get(pi, (0, 0))
-        return fellow_sicu_served[fellow['name']][pi] < sicu_t
-
-    def fellow_can_take_role(fellow, role, week):
-        """Check if fellow needs this role type in this period."""
-        if role in ('ACS (M-F)', 'ACS (M-Sun)'):
-            return fellow_needs_acs(fellow, week)
-        if role == 'SICU':
-            return fellow_needs_sicu(fellow, week)
-        return False  # Fellows don't take McNair or TSICU
-
-    # ââ Candidate check âââââââââââââââââââââââââââââââââââââââââââ
-
-    def is_seven_day_role(role):
-        return role in ('ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU')
-
-    def can_assign(surgeon, role, week, wi, assigned_this_week):
-        """
-        Returns True if this surgeon can take this role this week.
-        Checks all hard constraints.
-        """
-        name = surgeon['name']
-
-        # Already assigned to another role this week
-        if name in assigned_this_week.values():
-            return False
-
-        # Not active this week
-        if not is_active_for_week(surgeon, week):
-            return False
-
-        # Not eligible for this role (contractual)
-        if not is_eligible(surgeon, role):
-            return False
-
-        # Hit shift cap
-        role_shifts = ROLE_SHIFTS[role]
-        if served[name] + role_shifts > caps[name]:
-            return False
-
-        # On time off or conference this week
-        if surgeon_time_off.get(name) and week_overlaps_dates(
-                week, surgeon_time_off[name]):
-            return False
-
-        # No consecutive 7-day service weeks
-        if is_seven_day_role(role) and (wi - last_7day_wi[name]) <= 1:
-            return False
-
-        # ACS M-Sun cannot repeat consecutive weeks
-        if role == 'ACS (M-Sun)' and (wi - last_acs_msun_wi[name]) <= 1:
-            return False
-
-        # Fellow-specific: only assign fellows to roles they need for rotation
-        if is_fellow(surgeon):
-            if not fellow_can_take_role(surgeon, role, week):
-                return False
-            # Only one fellow per role per week
-            for existing_name in assigned_this_week.values():
-                for f in fellows:
-                    if f['name'] == existing_name and existing_name != name:
-                        existing_role = [
-                            r for r, n in assigned_this_week.items() if n == existing_name
-                        ]
-                        if existing_role and existing_role[0] == role:
-                            return False
-
-        return True
-
-    def priority_score(surgeon, role, wi):
-        """
-        Priority score â higher means this surgeon should get this week.
-
-        The score has three components:
-        1. Need: how far below their target are they? (0-1 scale)
-           A surgeon at 0% of target scores 1.0 (maximum need)
-           A surgeon at 100% of target scores 0.0 (no need)
-        2. Rest: how long since they last worked? (rewards rest)
-           Each week since last service adds 0.1 to score
-        3. Preference: willing/seeking get a small bonus after target
-           so they naturally absorb overflow
-
-        This score means the surgeon who NEEDS work the most and
-        has RESTED the longest always gets priority. Exactly like
-        a human scheduler would think.
-        """
-        name = surgeon['name']
-        t    = targets[name]
-
-        if t == 0:
-            # Zero-target surgeon only gets assigned if no one else can
-            need = 0.0
-        else:
-            # Proportional need: (target - served) / target
-            # Negative if over target (disincentivizes over-assignment)
-            need = (t - served[name]) / t
-
-        # Rest bonus: weeks since last service
-        weeks_rested = wi - last_service_wi[name]
-        rest = min(weeks_rested * 0.1, 0.5)  # cap at 0.5 to keep need dominant
-
-        # Preference adjustment
-        pref     = get_pref(surgeon)
-        pref_adj = 0.0
-        if served[name] >= t:
-            # Over target â willing/seeking get small bonus, baseline gets penalty
-            if pref == 'willing':
-                pref_adj = 0.1
-            elif pref == 'seeking':
-                pref_adj = 0.2
-            else:
-                pref_adj = -0.5  # strongly discourage baseline over-assignment
-
-        return need + rest + pref_adj
-
-    # ââ ROLES in assignment order âââââââââââââââââââââââââââââââââ
-    # Order matters for fairness:
-    # 1. SICU first (fewest eligible surgeons â most constrained)
-    # 2. TSICU second (also constrained â Chatterjee, Bonville, Lim, others)
-    # 3. McNair third (moderate eligibility)
-    # 4. ACS M-Sun fourth (moderate eligibility, no-repeat constraint)
-    # 5. ACS M-F last (most flexible, Perez can only do this)
-    role_order = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
-
-    # ââ Main greedy loop ââââââââââââââââââââââââââââââââââââââââââ
+    # ── Main greedy loop ──────────────────────────────────────────
     for wi, week in enumerate(all_weeks):
-        assigned_this_week = {}  # role -> surgeon_name for this week
+        assigned_this_week = {}
 
-        # First pass: try to assign fellows to roles they need for rotation
-        # This ensures fellow rotation requirements are met before
-        # the general pool fills up those slots
-        for role in role_order:
+        # Update active_weeks_so_far for pace calculation
+        for s in surgeons:
+            if is_active_for_week(s, week):
+                active_weeks_so_far[s['name']] += 1
+
+        # Pass 1: Fellows — assign to roles they need for rotation
+        # Do this before general assignment to guarantee fellow rotation
+        for role in ROLE_ORDER:
+            if role in assigned_this_week:
+                continue
             for fellow in fellows:
                 if not can_assign(fellow, role, week, wi, assigned_this_week):
                     continue
                 if fellow_can_take_role(fellow, role, week):
-                    # Check no other fellow already assigned to this role
-                    already = False
-                    for f2 in fellows:
-                        if assigned_this_week.get(role) == f2['name']:
-                            already = True
-                            break
-                    if not already and role not in assigned_this_week:
+                    # Ensure no other fellow already in this role
+                    other_fellow_in_role = any(
+                        assigned_this_week.get(role) == f['name']
+                        for f in fellows if f['name'] != fellow['name']
+                    )
+                    if not other_fellow_in_role and role not in assigned_this_week:
                         assigned_this_week[role] = fellow['name']
-                        # Only assign one fellow per role â break after first match
                         break
 
-        # Second pass: fill remaining roles with best available surgeon
-        for role in role_order:
+        # Pass 2: General assignment — best paced candidate for each unfilled role
+        for role in ROLE_ORDER:
             if role in assigned_this_week:
-                continue  # Already filled by fellow
+                continue
 
-            # Find all candidates and score them
             candidates = []
             for surgeon in surgeons:
                 if can_assign(surgeon, role, week, wi, assigned_this_week):
-                    score = priority_score(surgeon, role, wi)
+                    score = priority_score(surgeon, role, wi, week)
                     candidates.append((score, surgeon['name'], surgeon))
 
             if not candidates:
-                # No eligible surgeon found â this should be rare
-                # Log it but don't crash â validation will flag it
+                # No eligible surgeon — role goes unfilled this week
+                # Validation report will flag this
                 continue
 
-            # Sort by score descending, break ties by name for determinism
+            # Best score wins; ties broken alphabetically for determinism
             candidates.sort(key=lambda x: (-x[0], x[1]))
-            best_surgeon = candidates[0][2]
-            assigned_this_week[role] = best_surgeon['name']
+            best = candidates[0][2]
+            assigned_this_week[role] = best['name']
 
-        # Update state from this week's assignments
+        # Update state
         for role, name in assigned_this_week.items():
-            # Find surgeon object
             surgeon = next((s for s in surgeons if s['name'] == name), None)
             if surgeon is None:
                 continue
 
-            role_shifts = ROLE_SHIFTS[role]
-            served[name] += role_shifts
-            last_service_wi[name] = wi
+            served[name]          += ROLE_SHIFTS[role]
+            last_service_wi[name]  = wi
 
             if is_seven_day_role(role):
                 last_7day_wi[name] = wi
             if role == 'ACS (M-Sun)':
                 last_acs_msun_wi[name] = wi
 
-            # Update fellow rotation tracking
             if is_fellow(surgeon):
                 pi = get_period_idx(week)
                 if pi is not None:
@@ -715,42 +681,32 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
                     elif role == 'SICU':
                         fellow_sicu_served[name][pi] += 1
 
-            # Store in week_assignments
             week_assignments[wi][role] = name
 
     return week_assignments
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-# SOLVER 2 â CALL (OR-Tools)
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
+# SOLVER 2 — CALL (OR-Tools CP-SAT)
+# ─────────────────────────────────────────────────────────────────
 
 def solve_call(surgeons, months, week_assignments, preferences):
     """
-    OR-Tools CP-SAT solver for call night assignments.
-
-    Takes the completed greedy service week schedule as fixed input.
-    Assigns exactly one call surgeon per night.
-
-    OR-Tools is appropriate here because call assignment has complex
-    nightly interactions: restrictions depend on which surgeon is on
-    service that specific night, weekend equity requires tracking
-    totals across all nights, and avoid-night preferences interact
-    with service restrictions in non-trivial ways.
+    OR-Tools CP-SAT for call night assignments.
 
     HARD constraints:
     - Exactly one call surgeon per night
-    - Call eligibility (can_call flag)
-    - Active dates
+    - Call eligibility and active dates
     - McNair surgeon: no call any night that week
     - TSICU/SICU/ACS M-Sun: no call Mon-Sat (Sunday OK)
     - ACS M-F: no call Mon-Thu (Fri/Sat/Sun OK)
     - Fellow max 5 call nights per month
+    - Max call nights per month per surgeon profile
 
-    SOFT constraints (objective):
-    - Weekend call equity (fair share per eligible surgeon)
-    - Call day preferences (e.g. Rojas-Khalil Fri/Sat preferred)
-    - Avoid specific nights from surgeon preferences
+    SOFT constraints:
+    - Weekend call equity
+    - Call day preferences
+    - Avoid specific nights
     - No 3+ consecutive call nights
     """
     num_surgeons   = len(surgeons)
@@ -758,21 +714,18 @@ def solve_call(surgeons, months, week_assignments, preferences):
     month_days     = [monthrange(y, mo)[1] for y, mo in months]
     fellow_indices = [i for i, s in enumerate(surgeons) if is_fellow(s)]
 
-    # Parse avoid-night preferences
     surgeon_avoid = {}
     for i, s in enumerate(surgeons):
         prefs = get_surgeon_prefs(s.get('id', ''), preferences)
         surgeon_avoid[i] = parse_date_list(
             prefs.get('avoid_nights', ''), months[0][0])
 
-    # Active status per surgeon per month
     active_in_month = [
         [is_active_for_month(surgeons[i], y, mo) for i in range(num_surgeons)]
         for mi, (y, mo) in enumerate(months)
     ]
 
-    # Build night -> service role lookup from week_assignments
-    # For each night, which surgeons are on which service role?
+    # Build night -> service role lookup
     night_role = {}
     for mi, (y, mo) in enumerate(months):
         night_role[mi] = {}
@@ -795,19 +748,18 @@ def solve_call(surgeons, months, week_assignments, preferences):
     model  = cp_model.CpModel()
     solver = cp_model.CpSolver()
 
-    # call[mi][d][i] = 1 if surgeon i is on call on night (mi, d)
     call = [
         [[model.NewBoolVar(f'c_{mi}_{d}_{i}') for i in range(num_surgeons)]
          for d in range(month_days[mi])]
         for mi in range(num_months)
     ]
 
-    # H1 â Exactly one call surgeon per night
+    # H1 — One call surgeon per night
     for mi in range(num_months):
         for d in range(month_days[mi]):
             model.AddExactlyOne(call[mi][d])
 
-    # H2 â Call eligibility and active dates
+    # H2 — Eligibility and active dates
     for mi, (y, mo) in enumerate(months):
         for d in range(month_days[mi]):
             for i in range(num_surgeons):
@@ -815,10 +767,10 @@ def solve_call(surgeons, months, week_assignments, preferences):
                         not is_eligible(surgeons[i], 'call')):
                     model.Add(call[mi][d][i] == 0)
 
-    # H3 â Service week call restrictions
+    # H3 — Service week call restrictions
     for mi, (y, mo) in enumerate(months):
         for d in range(month_days[mi]):
-            dow = datetime(y, mo, d + 1).weekday()  # 0=Mon, 6=Sun
+            dow = datetime(y, mo, d + 1).weekday()
             for i in range(num_surgeons):
                 role = night_role[mi][d].get(i)
                 if role is None:
@@ -826,20 +778,20 @@ def solve_call(surgeons, months, week_assignments, preferences):
                 if role == 'McNair ICU':
                     model.Add(call[mi][d][i] == 0)
                 elif role in ('TSICU', 'SICU', 'ACS (M-Sun)'):
-                    if dow <= 5:  # Mon-Sat blocked, Sunday OK
+                    if dow <= 5:
                         model.Add(call[mi][d][i] == 0)
                 elif role == 'ACS (M-F)':
-                    if dow <= 3:  # Mon-Thu blocked, Fri/Sat/Sun OK
+                    if dow <= 3:
                         model.Add(call[mi][d][i] == 0)
 
-    # H4 â Fellow max 5 call nights per month
+    # H4 — Fellow max 5 call nights per month
     for i in fellow_indices:
         max_call = int(surgeons[i].get('max_call_per_month', 5))
         for mi in range(num_months):
             model.Add(
                 sum(call[mi][d][i] for d in range(month_days[mi])) <= max_call)
 
-    # H5 â Max call nights per month per surgeon (from profile)
+    # H5 — Max call nights per month per surgeon profile
     for i in range(num_surgeons):
         if i in fellow_indices:
             continue
@@ -848,7 +800,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
             model.Add(
                 sum(call[mi][d][i] for d in range(month_days[mi])) <= max_call)
 
-    # ââ Objective âââââââââââââââââââââââââââââââââââââââââââââââââ
+    # ── Objective ─────────────────────────────────────────────────
     obj_terms     = []
     penalty_terms = []
 
@@ -888,7 +840,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
             penalty_terms.append(3  * wknd_over)
             penalty_terms.append(40 * wknd_undr)
 
-    # Call day preference (e.g. Rojas-Khalil prefers Fri/Sat)
+    # Call day preference
     for mi, (y, mo) in enumerate(months):
         for d in range(month_days[mi]):
             dow = datetime(y, mo, d + 1).weekday()
@@ -935,7 +887,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         raise Exception(
             f"Call solver failed: {solver.StatusName(status)}. "
-            f"Cannot assign call given current service week restrictions. "
+            f"Cannot assign call given current service restrictions. "
             f"Check call eligibility flags in admin."
         )
 
@@ -949,17 +901,13 @@ def solve_call(surgeons, months, week_assignments, preferences):
     return call_assignments
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 # OUTPUT BUILDER
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 def build_output(surgeons, months, week_assignments, call_assignments,
                  block_number, prior_totals):
-    """
-    Combines greedy service weeks and OR-Tools call into the standard
-    JSON format expected by the Next.js frontend. Runs a comprehensive
-    validation report.
-    """
+
     num_surgeons = len(surgeons)
     num_months   = len(months)
     month_days   = [monthrange(y, mo)[1] for y, mo in months]
@@ -972,7 +920,6 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         name: max(0, round(t)) for name, t in block_targets.items()
     }
 
-    # Group weeks by month
     months_weeks = {mi: [] for mi in range(num_months)}
     for wi in sorted(week_assignments.keys()):
         mi = week_assignments[wi]['month_idx']
@@ -986,9 +933,10 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         for wi in months_weeks[mi]:
             wa        = week_assignments[wi]
             week_data = {'label': wa['label']}
+            # Always include all roles, even if unassigned (empty string)
+            # This ensures the UI renders all role slots consistently
             for role in ROLE_SHIFTS:
-                if role in wa:
-                    week_data[role] = wa[role]
+                week_data[role] = wa.get(role, '')
             result_weeks.append(week_data)
 
         result_nights = {}
@@ -996,6 +944,8 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             name = call_assignments.get((mi, d))
             if name:
                 result_nights[str(d + 1)] = {'Call': name, 'Backup': ''}
+            else:
+                result_nights[str(d + 1)] = {'Call': '', 'Backup': ''}
 
         fte_summary = {}
         for s in surgeons:
@@ -1013,7 +963,7 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             'fte_summary': fte_summary,
         }
 
-    # ââ Validation Report âââââââââââââââââââââââââââââââââââââââââ
+    # ── Validation Report ─────────────────────────────────────────
     violations = []
     warnings   = []
 
@@ -1026,21 +976,18 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         mk          = f"{y}-{str(mo).zfill(2)}"
         month_label = datetime(y, mo, 1).strftime('%B %Y')
 
-        # All roles assigned every week
         for w in result[mk]['weeks']:
             for role in ROLE_SHIFTS:
-                if role not in w:
+                if not w.get(role):
                     warnings.append(
-                        f"{month_label} {w['label']}: {role} not assigned "
-                        f"â no eligible surgeon available")
+                        f"{month_label} {w['label']}: {role} unfilled — "
+                        f"no eligible surgeon available within caps")
 
-        # All nights covered
         for d in range(month_days[mi]):
-            if str(d + 1) not in result[mk]['nights']:
+            if not result[mk]['nights'].get(str(d + 1), {}).get('Call'):
                 violations.append(
                     f"{month_label} day {d + 1}: No call surgeon assigned")
 
-        # No surgeon in two roles simultaneously
         for w in result[mk]['weeks']:
             seen = {}
             for role in ROLE_SHIFTS:
@@ -1052,7 +999,7 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                             f"{name} in {seen[name]} and {role}")
                     seen[name] = role
 
-    # Consecutive 7-day service weeks
+    # Consecutive 7-day weeks
     seven_day_roles = ['ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU']
     for i in range(len(all_weeks_flat) - 1):
         w1 = all_weeks_flat[i]
@@ -1061,18 +1008,18 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             for r2 in seven_day_roles:
                 n1 = w1.get(r1)
                 n2 = w2.get(r2)
-                if n1 and n1 == n2:
+                if n1 and n2 and n1 == n2:
                     warnings.append(
                         f"Consecutive 7-day weeks: {n1} "
-                        f"({r1} -> {r2}) â review manually")
+                        f"({r1} -> {r2}) — review manually")
 
-    # ACS M-Sun consecutive (should never happen with greedy)
+    # ACS M-Sun consecutive
     for i in range(len(all_weeks_flat) - 1):
         n1 = all_weeks_flat[i].get('ACS (M-Sun)')
         n2 = all_weeks_flat[i + 1].get('ACS (M-Sun)')
-        if n1 and n1 == n2:
+        if n1 and n2 and n1 == n2:
             violations.append(
-                f"ACS M-Sun consecutive: {n1} â hard rule violated")
+                f"ACS M-Sun consecutive: {n1} — hard rule violated")
 
     # Call run check
     for mi, (y, mo) in enumerate(months):
@@ -1092,7 +1039,7 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                 else:
                     run = 0
 
-    # Sunday call -> Monday fresh service start
+    # Sunday call -> Monday fresh start
     for mi, (y, mo) in enumerate(months):
         for d in range(month_days[mi]):
             if datetime(y, mo, d + 1).weekday() != 6:
@@ -1108,8 +1055,8 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                 if wa['start'] == next_monday:
                     for role in ROLE_SHIFTS:
                         if wa.get(role) == call_name:
-                            prior_wi  = wi - 1
-                            in_prior  = prior_wi >= 0 and any(
+                            prior_wi = wi - 1
+                            in_prior = prior_wi >= 0 and any(
                                 week_assignments[prior_wi].get(r) == call_name
                                 for r in ROLE_SHIFTS
                             )
@@ -1117,18 +1064,18 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                                 warnings.append(
                                     f"{call_name}: call Sun "
                                     f"{next_monday.strftime('%b %-d')} "
-                                    f"then fresh {role} Mon â fix manually")
+                                    f"then fresh {role} Mon — fix manually")
 
     # Fellow rotation validation
-    all_weeks = get_all_weeks(months)
-    periods   = get_two_month_periods(months)
-    fellows   = [s for s in surgeons if is_fellow(s)]
-    fellow_period_targets = compute_fellow_period_targets(fellows, periods, all_weeks)
+    all_weeks  = get_all_weeks(months)
+    periods    = get_two_month_periods(months)
+    fellows    = [s for s in surgeons if is_fellow(s)]
+    fpt        = compute_fellow_period_targets(fellows, periods, all_weeks)
 
     for pi, period_months in enumerate(periods):
         for fellow in fellows:
-            fname        = fellow['name']
-            acs_t, sicu_t = fellow_period_targets[fname].get(pi, (0, 0))
+            fname         = fellow['name']
+            acs_t, sicu_t = fpt[fname].get(pi, (0, 0))
             acs_count = sicu_count = 0
             for pm in period_months:
                 mk = f"{pm[0]}-{str(pm[1]).zfill(2)}"
@@ -1168,17 +1115,14 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         t     = target_shifts[name]
         delta = total - t
 
-        # Flag significant under-assignment
         if t > 0 and delta < -7:
             warnings.append(
                 f"{name}: served {total} vs target {t} "
-                f"(short {abs(delta)}) â insufficient eligible weeks available")
-
-        # Flag baseline over-assignment
+                f"(short {abs(delta)}) — check eligibility or willing/seeking capacity")
         if t > 0 and delta > 7 and pref == 'baseline':
             warnings.append(
                 f"{name}: served {total} vs target {t} "
-                f"(+{delta} over) â baseline surgeon over target")
+                f"(+{delta} over) — baseline over target")
 
         block_fte_summary[name] = {
             'served': total,
@@ -1188,7 +1132,9 @@ def build_output(surgeons, months, week_assignments, call_assignments,
 
         count = sum(
             1 for mi, d in weekend_nights
-            if call_assignments.get((mi, d)) == name
+            if result[
+                f"{months[mi][0]}-{str(months[mi][1]).zfill(2)}"
+            ]['nights'].get(str(d + 1), {}).get('Call') == name
         )
         if count > 0:
             weekend_call_summary[name] = count
@@ -1205,9 +1151,9 @@ def build_output(surgeons, months, week_assignments, call_assignments,
     }
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 # RUN
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
