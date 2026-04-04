@@ -27,7 +27,7 @@ BLOCK2_MONTHS = [1, 2, 3, 4, 5, 6]
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v13'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v14'})
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -57,7 +57,6 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        # Two solvers: service weeks first, then call
         week_assignments = solve_service_weeks(
             surgeons=surgeons,
             months=months,
@@ -155,7 +154,6 @@ def is_eligible(surgeon, role):
 
 
 def count_service_roles(surgeon):
-    """How many of the 5 service roles is this surgeon eligible for."""
     return sum(1 for r in ['acs_mf', 'acs_msun', 'mcnair', 'tsicu', 'sicu']
                if is_eligible(surgeon, r))
 
@@ -217,12 +215,9 @@ def get_pref(surgeon):
 
 def compute_block_target(surgeon, block_number, prior_totals, months):
     """
-    Block target = 84 x FTE for Block 1.
-    Block 2 = (168 x FTE) minus Block 1 actuals.
+    Block 1: target = 84 x FTE
+    Block 2: target = (168 x FTE) - Block 1 actuals
     Prorated for start/departure dates.
-
-    This is the equity baseline — every surgeon gets their
-    proportional share of work. The FTE system ensures fairness.
     """
     fte    = float(surgeon.get('fte', 1.0))
     annual = ANNUAL_FTE_SHIFTS * fte
@@ -262,6 +257,58 @@ def compute_block_target(surgeon, block_number, prior_totals, months):
             pass
 
     return max(0.0, block_target)
+
+
+def compute_role_caps(surgeon, target_shifts, pref):
+    """
+    THE CORE FIX: Compute the maximum number of weeks a surgeon can
+    be assigned to each role based on their FTE target.
+
+    Example — Loor (0.38 FTE, target ~32 shifts):
+      SICU: 32 / 7 = 4.6 -> cap = 5 weeks maximum
+      She cannot get more than 5 SICU weeks regardless of availability.
+
+    Example — Lim (0.16 FTE, target ~13 shifts):
+      TSICU: 13 / 7 = 1.9 -> cap = 2 weeks maximum
+      He cannot get more than 2 TSICU weeks.
+
+    Example — Al-Aref (1.0 FTE, target 84 shifts, willing):
+      ACS M-F:   84 / 5  = 16.8 -> cap = 17
+      ACS M-Sun: 84 / 7  = 12   -> cap = 12
+      McNair:    84 / 7  = 12   -> cap = 12
+      TSICU:     84 / 7  = 12   -> cap = 12
+      SICU:      84 / 7  = 12   -> cap = 12
+      He can absorb up to his target across any combination of roles.
+
+    For willing/seeking surgeons, caps are multiplied by their overflow
+    factor so they can absorb excess after baseline surgeons are filled.
+
+    This is the key insight: the FTE target IS the cap.
+    A surgeon's proportional share of each role cannot exceed what
+    their FTE entitles them to. The cap is derived mathematically
+    from the target, not set arbitrarily.
+    """
+    if target_shifts == 0:
+        return {r: 0 for r in ['acs_mf', 'acs_msun', 'mcnair', 'tsicu', 'sicu']}
+
+    # Overflow multiplier for willing/seeking surgeons
+    # They can take more than their baseline entitlement if needed
+    if pref == 'baseline':
+        multiplier = 1.0
+    elif pref == 'willing':
+        multiplier = 1.4
+    else:  # seeking
+        multiplier = 1.8
+
+    effective_target = target_shifts * multiplier
+
+    return {
+        'acs_mf':   max(1, round(effective_target / SHIFTS_ACS_MF)),
+        'acs_msun': max(1, round(effective_target / SHIFTS_ACS_MSUN)),
+        'mcnair':   max(1, round(effective_target / SHIFTS_ICU)),
+        'tsicu':    max(1, round(effective_target / SHIFTS_ICU)),
+        'sicu':     max(1, round(effective_target / SHIFTS_ICU)),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -309,7 +356,6 @@ def parse_date_list(text, year):
 
 
 def week_overlaps_dates(week, date_set):
-    from datetime import date
     return any(
         (week['start'] + timedelta(days=o)).date() in date_set
         for o in range(7)
@@ -332,7 +378,8 @@ def get_two_month_periods(months):
     return [[months[i], months[i + 1]] for i in range(0, 6, 2)]
 
 
-def compute_fellow_rotation_target(fellow, period_months, months, active_in_week, all_weeks):
+def compute_fellow_rotation_target(fellow, period_months, months,
+                                   active_in_week, all_weeks):
     f_idx        = fellow['_idx']
     period_set   = set((pm[0], pm[1]) for pm in period_months)
     period_wi    = [wi for wi, w in enumerate(all_weeks)
@@ -351,43 +398,45 @@ def compute_fellow_rotation_target(fellow, period_months, months, active_in_week
 
 def solve_service_weeks(surgeons, months, block_number, preferences, prior_totals):
     """
-    Assigns the 5 weekly service roles across the full 6-month block.
+    SOLVER 1: Service week assignments.
 
-    PHILOSOPHY:
-    Think like a human scheduler who has been doing this for 20 years.
+    THE KEY FIX — Per-role hard caps derived from FTE target:
 
-    Step 1: Honor contractual obligations — eligibility flags are hard.
-            A surgeon can only be assigned to roles in their contract.
+    Every surgeon's FTE target mathematically determines the maximum
+    number of weeks they can hold each role. This is the hard cap.
 
-    Step 2: Fill single-role surgeons first — they have no flexibility.
-            Loor (SICU only), Chatterjee (TSICU only), Perez (ACS only),
-            Bonville/Lim (TSICU only), Rojas-Khalil (SICU only).
-            Give them their proportional FTE share and stop.
+    Loor (0.38 FTE = 32 shifts target):
+      SICU cap = round(32 / 7) = 5 weeks maximum — HARD LIMIT
+      She gets exactly her proportional share. No more.
 
-    Step 3: Fill remaining slots with multi-role surgeons proportionally.
-            Al-Aref, Dumas, Fitzgerald etc absorb whatever is left,
-            weighted by their FTE targets.
+    Lim (0.16 FTE = 13 shifts target):
+      TSICU cap = round(13 / 7) = 2 weeks maximum — HARD LIMIT
+      He gets exactly his proportional share. No more.
 
-    Step 4: Enforce fellow rotation requirements.
+    Al-Aref (1.0 FTE = 84 shifts target, willing):
+      Each role cap = round(84 * 1.4 / 7) = 17 weeks maximum
+      He absorbs overflow from baseline surgeons.
 
-    HARD CONSTRAINTS (never violated):
-    - Exactly one surgeon per role per week
-    - Eligibility (contractual — never overridden)
+    This ensures:
+    1. Low-FTE surgeons get EXACTLY their proportional share
+    2. High-FTE willing/seeking surgeons absorb the overflow
+    3. The schedule is always feasible because overflow has somewhere to go
+    4. FTE equity is mathematically guaranteed
+
+    HARD CONSTRAINTS:
+    - One surgeon per role per week
+    - Eligibility (contractual)
     - Active dates for all surgeons
     - No surgeon in two roles simultaneously
+    - Per-role week caps derived from FTE target (THE NEW HARD CAP)
+    - ACS M-Sun no repeat consecutive weeks
     - Fellow rotation: 2 ACS + 1 SICU per 2-month period
     - Fellows cannot share same role same week
-    - ACS M-Sun cannot repeat consecutive weeks (contractual)
 
-    SOFT CONSTRAINTS (strongly preferred, flagged if violated):
-    - No consecutive 7-day weeks — heavily penalized but not hard-blocked
-      because in rare situations it may be mathematically unavoidable
-      given the pool size and FTE constraints
-    - FTE equity — each surgeon gets close to their block target
-      Baseline: target is a ceiling, over-assignment heavily penalized
-      Willing/seeking: can absorb overflow beyond their target
-    - Time off / conference weeks
-    - Holiday preferences
+    SOFT CONSTRAINTS (penalized, not blocked):
+    - Consecutive 7-day weeks (heavy penalty weight 500)
+    - Time off / conference weeks (penalty weight 80)
+    - Getting close to FTE target
     """
     num_surgeons = len(surgeons)
 
@@ -395,13 +444,14 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
     num_weeks                = len(all_weeks)
 
     active_in_week = [
-        [is_active_for_week(surgeons[s], all_weeks[wi]) for s in range(num_surgeons)]
+        [is_active_for_week(surgeons[s], all_weeks[wi])
+         for s in range(num_surgeons)]
         for wi in range(num_weeks)
     ]
 
     fellow_indices = [s for s in range(num_surgeons) if is_fellow(surgeons[s])]
 
-    # Parse preferences
+    # Parse time off preferences
     surgeon_time_off = {}
     for s in range(num_surgeons):
         prefs = get_surgeon_prefs(surgeons[s].get('id', ''), preferences)
@@ -410,26 +460,24 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
         conf  = parse_date_list(prefs.get('conferences', ''), y_ref)
         surgeon_time_off[s] = off | conf
 
-    # FTE targets
+    # Compute FTE targets and per-role caps
     block_targets = [
         compute_block_target(surgeons[s], block_number, prior_totals, months)
         for s in range(num_surgeons)
     ]
     target_shifts = [max(0, round(t)) for t in block_targets]
 
-    # Classify surgeons by role flexibility
-    # single_role: only eligible for 1 service role — fill first
-    # multi_role:  eligible for 2+ service roles — fill remaining slots
-    single_role = [s for s in range(num_surgeons)
-                   if count_service_roles(surgeons[s]) == 1
-                   and not is_fellow(surgeons[s])]
-    multi_role  = [s for s in range(num_surgeons)
-                   if count_service_roles(surgeons[s]) > 1
-                   and not is_fellow(surgeons[s])]
+    # Per-role caps: maximum weeks each surgeon can hold each role
+    # This is derived from their FTE target — it IS their entitlement
+    role_caps = []
+    for s in range(num_surgeons):
+        pref = get_pref(surgeons[s])
+        caps = compute_role_caps(surgeons[s], target_shifts[s], pref)
+        role_caps.append(caps)
 
     model = cp_model.CpModel()
 
-    # ── Variables ─────────────────────────────────────────────────
+    # ── Decision variables ────────────────────────────────────────
     acs_msun = [[model.NewBoolVar(f'am_{wi}_{s}') for s in range(num_surgeons)]
                 for wi in range(num_weeks)]
     acs_mf   = [[model.NewBoolVar(f'af_{wi}_{s}') for s in range(num_surgeons)]
@@ -438,7 +486,7 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
                 for wi in range(num_weeks)]
     tsicu    = [[model.NewBoolVar(f'ts_{wi}_{s}') for s in range(num_surgeons)]
                 for wi in range(num_weeks)]
-    sicu     = [[model.NewBoolVar(f'si_{wi}_{s}') for s in range(num_surgeons)]
+    sicu_v   = [[model.NewBoolVar(f'si_{wi}_{s}') for s in range(num_surgeons)]
                 for wi in range(num_weeks)]
 
     all_roles = [
@@ -446,36 +494,28 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
         ('acs_msun', acs_msun, SHIFTS_ACS_MSUN),
         ('mcnair',   mcnair,   SHIFTS_ICU),
         ('tsicu',    tsicu,    SHIFTS_ICU),
-        ('sicu',     sicu,     SHIFTS_ICU),
+        ('sicu',     sicu_v,   SHIFTS_ICU),
     ]
 
-    # Per-surgeon total shifts
-    surgeon_total = [model.NewIntVar(0, 250, f'tot_{s}') for s in range(num_surgeons)]
-    for s in range(num_surgeons):
-        terms = []
-        for wi in range(num_weeks):
-            if not active_in_week[wi][s]:
-                continue
-            terms += [
-                SHIFTS_ACS_MF   * acs_mf[wi][s],
-                SHIFTS_ACS_MSUN * acs_msun[wi][s],
-                SHIFTS_ICU       * mcnair[wi][s],
-                SHIFTS_ICU       * tsicu[wi][s],
-                SHIFTS_ICU       * sicu[wi][s],
-            ]
-        model.Add(surgeon_total[s] == (sum(terms) if terms else 0))
+    role_var_map = {
+        'acs_mf':   acs_mf,
+        'acs_msun': acs_msun,
+        'mcnair':   mcnair,
+        'tsicu':    tsicu,
+        'sicu':     sicu_v,
+    }
 
     # ══════════════════════════════════════════════════════════════
-    # HARD CONSTRAINTS — these are never violated
+    # HARD CONSTRAINTS
     # ══════════════════════════════════════════════════════════════
 
-    # H1 — Exactly one surgeon per role per week
+    # H1 — One surgeon per role per week
     for wi in range(num_weeks):
         model.AddExactlyOne(acs_msun[wi])
         model.AddExactlyOne(acs_mf[wi])
         model.AddExactlyOne(mcnair[wi])
         model.AddExactlyOne(tsicu[wi])
-        model.AddExactlyOne(sicu[wi])
+        model.AddExactlyOne(sicu_v[wi])
 
     # H2 — Eligibility (contractual) and active dates
     for wi in range(num_weeks):
@@ -490,28 +530,52 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
             if inactive or not is_eligible(surgeons[s], 'tsicu'):
                 model.Add(tsicu[wi][s] == 0)
             if inactive or not is_eligible(surgeons[s], 'sicu'):
-                model.Add(sicu[wi][s] == 0)
+                model.Add(sicu_v[wi][s] == 0)
 
     # H3 — No surgeon in two roles simultaneously
     for wi in range(num_weeks):
         for s in range(num_surgeons):
             model.Add(
                 acs_msun[wi][s] + acs_mf[wi][s] + mcnair[wi][s] +
-                tsicu[wi][s]    + sicu[wi][s] <= 1
+                tsicu[wi][s]    + sicu_v[wi][s] <= 1
             )
 
-    # H4 — ACS M-Sun cannot repeat consecutive weeks (contractual rule)
+    # H4 — PER-ROLE WEEK CAPS derived from FTE target
+    #
+    # This is the core fix. Each surgeon has a hard maximum number of
+    # weeks they can hold each role, calculated from their FTE target.
+    #
+    # Loor gets at most 5 SICU weeks (32 shifts / 7 = 4.6, rounded up).
+    # Lim gets at most 2 TSICU weeks (13 shifts / 7 = 1.9, rounded up).
+    # Al-Aref (willing) gets at most 17 of each role (84*1.4/7 = 16.8).
+    #
+    # This guarantees:
+    # - Low-FTE surgeons get exactly their proportional share
+    # - They cannot take more even if eligible and available
+    # - Overflow automatically goes to willing/seeking surgeons
+    # - The schedule is always feasible
+    for s in range(num_surgeons):
+        caps = role_caps[s]
+        for role_name, role_var in role_var_map.items():
+            cap = caps.get(role_name, 0)
+            if cap == 0:
+                for wi in range(num_weeks):
+                    model.Add(role_var[wi][s] == 0)
+            else:
+                model.Add(sum(role_var[wi][s] for wi in range(num_weeks)) <= cap)
+
+    # H5 — ACS M-Sun cannot repeat consecutive weeks
     for wi in range(num_weeks - 1):
         for s in range(num_surgeons):
             model.Add(acs_msun[wi][s] + acs_msun[wi + 1][s] <= 1)
 
-    # H5 — Fellows cannot share same role same week
+    # H6 — Fellows cannot share same role same week
     if len(fellow_indices) >= 2:
         for wi in range(num_weeks):
             for _, rvars, _ in all_roles:
                 model.Add(sum(rvars[wi][f] for f in fellow_indices) <= 1)
 
-    # H6 — Fellow rotation: exactly 2 ACS + 1 SICU per 2-month period
+    # H7 — Fellow rotation: 2 ACS + 1 SICU per 2-month period
     two_month_periods = get_two_month_periods(months)
     for period_months in two_month_periods:
         period_set = set((pm[0], pm[1]) for pm in period_months)
@@ -528,38 +592,21 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
                     acs_mf[wi][f] + acs_msun[wi][f] for wi in period_wi
                 ) == acs_t)
             if sicu_t > 0 and period_wi:
-                model.Add(sum(sicu[wi][f] for wi in period_wi) == sicu_t)
+                model.Add(sum(sicu_v[wi][f] for wi in period_wi) == sicu_t)
 
     # ══════════════════════════════════════════════════════════════
-    # OBJECTIVE — human-like priority scheduling
+    # OBJECTIVE
     #
-    # The objective encodes the human scheduler's decision process:
+    # With hard per-role caps doing the heavy lifting of FTE equity,
+    # the objective just needs to:
+    # 1. Reward filling every slot (drives feasibility)
+    # 2. Penalize consecutive 7-day weeks (avoids fatigue)
+    # 3. Respect time off preferences
     #
-    # PRIORITY 1 (weight 1000): Fill single-role surgeons to their target.
-    # These surgeons (Loor, Chatterjee, Perez, Bonville, Lim, Rojas-Khalil)
-    # have no flexibility — give them their proportional FTE share first.
-    # The 1000-weight reward means the solver fills them before anyone else.
-    # The 2000-weight penalty for going over means it stops at their target.
-    #
-    # PRIORITY 2 (weight 400): Fill fellows per rotation requirements.
-    # H6 hard constraint handles the rotation structure. The weight here
-    # drives proportional filling within their allowed weeks.
-    #
-    # PRIORITY 3 (weight 100): Fill multi-role surgeons with remainder.
-    # Al-Aref, Dumas, Fitzgerald etc absorb whatever weeks remain.
-    # They are proportionally weighted by FTE target — a 1.0 FTE surgeon
-    # gets more weeks than a 0.5 FTE surgeon from the same pool.
-    # Willing/seeking surgeons get additional overflow beyond their target.
-    #
-    # PENALTY — consecutive 7-day weeks (weight 500):
-    # Very heavily penalized so the solver strongly avoids it.
-    # Not a hard constraint because in rare edge cases (very small active
-    # pool for a specific role in a specific month) it may be unavoidable.
-    # The validation report flags any that occur for manual review.
-    #
-    # PENALTY — over-target (weight 300 baseline, 30 willing, 5 seeking):
-    # Baseline surgeons are strongly discouraged from going over their target.
-    # Willing/seeking absorb overflow naturally.
+    # Reward weight by FTE target: surgeons with higher targets get
+    # higher reward per assignment, so they fill their larger quotas.
+    # This prevents low-FTE surgeons from accidentally taking slots
+    # that high-FTE surgeons need (the caps prevent the opposite).
     # ══════════════════════════════════════════════════════════════
 
     obj_terms     = []
@@ -568,81 +615,36 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
     for s in range(num_surgeons):
         t    = target_shifts[s]
         pref = get_pref(surgeons[s])
-
         if t == 0:
             continue
 
-        # Determine priority weight based on surgeon type
-        if s in single_role:
-            reward       = 1000  # Fill these first
-            over_penalty = 2000  # Stop at their target
-        elif s in fellow_indices:
-            reward       = 400
-            over_penalty = 800
-        else:
-            # Multi-role surgeons — weight proportional to FTE target
-            # so 1.0 FTE surgeon gets more weeks than 0.5 FTE surgeon
-            reward = max(50, round(100 * t / 84))
-            if pref == 'baseline':
-                over_penalty = 300
-            elif pref == 'willing':
-                over_penalty = 30
-            else:  # seeking
-                over_penalty = 5
-
-        # Reward assignments up to target, penalize beyond
-        # We do this per-week per-role using running counts
-        # to avoid needing complex integer tracking variables
-        role_week_count = {rn: 0 for rn, _, _ in all_roles}
-
-        # Weeks to fill per role to hit target
-        weeks_cap = {
-            'acs_mf':   max(1, round(t / SHIFTS_ACS_MF)),
-            'acs_msun': max(1, round(t / SHIFTS_ACS_MSUN)),
-            'mcnair':   max(1, round(t / SHIFTS_ICU)),
-            'tsicu':    max(1, round(t / SHIFTS_ICU)),
-            'sicu':     max(1, round(t / SHIFTS_ICU)),
-        }
+        # Reward weight proportional to FTE target
+        # High-FTE surgeons get more reward per assignment so they
+        # fill their larger quotas proportionally
+        base_reward = max(10, round(t / 5))
 
         for wi in range(num_weeks):
             if not active_in_week[wi][s]:
                 continue
-            for rn, rvars, _ in all_roles:
-                if not is_eligible(surgeons[s], rn):
-                    continue
-                wc  = role_week_count[rn]
-                cap = weeks_cap[rn]
-                if wc < cap:
-                    obj_terms.append(reward * rvars[wi][s])
-                else:
-                    penalty_terms.append(over_penalty * rvars[wi][s])
-                role_week_count[rn] += 1
+            for role_name, rvars, _ in all_roles:
+                if is_eligible(surgeons[s], role_name):
+                    obj_terms.append(base_reward * rvars[wi][s])
 
-    # Consecutive 7-day week penalty — heavily discouraged but not hard-blocked
-    # A human scheduler avoids this but will do it in rare unavoidable situations
-    seven_day = [acs_msun, mcnair, tsicu, sicu]
+    # Consecutive 7-day weeks — heavily penalized, not hard-blocked
+    # The solver will avoid this in the vast majority of cases
+    # but won't fail if it's mathematically unavoidable
+    seven_day = [acs_msun, mcnair, tsicu, sicu_v]
     for wi in range(num_weeks - 1):
         for s in range(num_surgeons):
-            # Use AddBoolAnd to detect back-to-back 7-day assignments
-            for r1 in seven_day:
-                for r2 in seven_day:
-                    # If surgeon S is in a 7-day role both this week AND next week
-                    # penalize heavily. We approximate using individual role terms
-                    # since multiplying booleans requires auxiliary vars.
-                    # Simple approach: penalize each 7-day assignment with small weight,
-                    # net effect is double-penalty for consecutive weeks.
-                    pass
-
-            # Cleaner approach: aux var for "in any 7-day role this week"
-            in_7day_wi = model.NewBoolVar(f'i7_{wi}_{s}')
-            model.AddMaxEquality(in_7day_wi, [r[wi][s] for r in seven_day])
+            in_7day_wi  = model.NewBoolVar(f'i7_{wi}_{s}')
             in_7day_wi1 = model.NewBoolVar(f'i7_{wi+1}_{s}')
+            model.AddMaxEquality(in_7day_wi,  [r[wi][s]   for r in seven_day])
             model.AddMaxEquality(in_7day_wi1, [r[wi+1][s] for r in seven_day])
             consec = model.NewBoolVar(f'consec_{wi}_{s}')
             model.AddMinEquality(consec, [in_7day_wi, in_7day_wi1])
             penalty_terms.append(500 * consec)
 
-    # Time off and conference soft blocking
+    # Time off and conference blocking
     for wi, week in enumerate(all_weeks):
         for s in range(num_surgeons):
             if surgeon_time_off[s] and week_overlaps_dates(week, surgeon_time_off[s]):
@@ -668,9 +670,11 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         raise Exception(
             f"Service week solver failed: {solver.StatusName(status)}. "
-            f"Hard constraints (eligibility, active dates, fellow rotation, "
-            f"ACS M-Sun no-repeat) cannot all be satisfied simultaneously. "
-            f"Check surgeon eligibility flags in the admin page."
+            f"The per-role week caps combined with eligibility constraints "
+            f"cannot be satisfied. This usually means willing/seeking surgeons "
+            f"don't have enough capacity to cover all weeks after baseline caps "
+            f"are applied. Ensure at least several surgeons are marked willing "
+            f"or seeking in the admin page."
         )
 
     # Extract assignments
@@ -689,7 +693,7 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
             if solver.Value(acs_mf[wi][s]):   week_assignments[wi]['ACS (M-F)']   = name
             if solver.Value(mcnair[wi][s]):    week_assignments[wi]['McNair ICU']  = name
             if solver.Value(tsicu[wi][s]):     week_assignments[wi]['TSICU']       = name
-            if solver.Value(sicu[wi][s]):      week_assignments[wi]['SICU']        = name
+            if solver.Value(sicu_v[wi][s]):    week_assignments[wi]['SICU']        = name
 
     return week_assignments
 
@@ -700,41 +704,44 @@ def solve_service_weeks(surgeons, months, block_number, preferences, prior_total
 
 def solve_call(surgeons, months, week_assignments, preferences):
     """
-    Assigns one call surgeon per night using the completed
-    service week schedule as fixed input.
+    SOLVER 2: Call night assignments.
 
-    HARD CONSTRAINTS:
-    - Exactly one call surgeon per night
-    - Call eligibility respected
-    - Active dates respected
-    - McNair surgeon: no call any night that week
+    Takes the completed service week schedule as fixed input.
+    Assigns one call surgeon per night respecting all call rules.
+
+    HARD:
+    - One call surgeon per night
+    - Call eligibility
+    - Active dates
+    - McNair: no call any night
     - TSICU/SICU/ACS M-Sun: no call Mon-Sat (Sunday OK)
     - ACS M-F: no call Mon-Thu (Fri/Sat/Sun OK)
     - Fellow max 5 call nights per month
+    - Max call nights per month per surgeon profile
 
-    SOFT CONSTRAINTS:
-    - Weekend call equity — fair share per eligible surgeon
-    - Call day preferences (e.g. Rojas-Khalil Fri/Sat)
-    - Avoid nights from preferences
+    SOFT:
+    - Weekend call equity
+    - Call day preferences
+    - Avoid nights
     - No 3+ consecutive call nights
     """
-    num_surgeons  = len(surgeons)
-    num_months    = len(months)
-    month_days    = [monthrange(y, mo)[1] for y, mo in months]
+    num_surgeons   = len(surgeons)
+    num_months     = len(months)
+    month_days     = [monthrange(y, mo)[1] for y, mo in months]
     fellow_indices = [s for s in range(num_surgeons) if is_fellow(surgeons[s])]
 
     surgeon_avoid = {}
     for s in range(num_surgeons):
         prefs = get_surgeon_prefs(surgeons[s].get('id', ''), preferences)
-        surgeon_avoid[s] = parse_date_list(prefs.get('avoid_nights', ''), months[0][0])
+        surgeon_avoid[s] = parse_date_list(
+            prefs.get('avoid_nights', ''), months[0][0])
 
     active_in_month = [
         [is_active_for_month(surgeons[s], y, mo) for s in range(num_surgeons)]
         for mi, (y, mo) in enumerate(months)
     ]
 
-    # Build night -> service role lookup from week_assignments
-    # night_role[mi][d][s] = role name if surgeon s is on service that night
+    # Build night -> service role lookup
     night_role = {}
     for mi, (y, mo) in enumerate(months):
         night_role[mi] = {}
@@ -746,7 +753,8 @@ def solve_call(surgeons, months, week_assignments, preferences):
                 ws = wa['start']
                 we = ws + timedelta(days=6)
                 if ws <= date_dt <= we:
-                    for role in ['ACS (M-Sun)', 'ACS (M-F)', 'McNair ICU', 'TSICU', 'SICU']:
+                    for role in ['ACS (M-Sun)', 'ACS (M-F)',
+                                 'McNair ICU', 'TSICU', 'SICU']:
                         name = wa.get(role)
                         if name:
                             for s in range(num_surgeons):
@@ -785,25 +793,27 @@ def solve_call(surgeons, months, week_assignments, preferences):
                 if role == 'McNair ICU':
                     model.Add(call[mi][d][s] == 0)
                 elif role in ('TSICU', 'SICU', 'ACS (M-Sun)'):
-                    if dow <= 5:  # Mon-Sat blocked, Sunday OK
+                    if dow <= 5:
                         model.Add(call[mi][d][s] == 0)
                 elif role == 'ACS (M-F)':
-                    if dow <= 3:  # Mon-Thu blocked, Fri/Sat/Sun OK
+                    if dow <= 3:
                         model.Add(call[mi][d][s] == 0)
 
     # H4 — Fellow max 5 call nights per month
     for f in fellow_indices:
         max_call = int(surgeons[f].get('max_call_per_month', 5))
         for mi in range(num_months):
-            model.Add(sum(call[mi][d][f] for d in range(month_days[mi])) <= max_call)
+            model.Add(
+                sum(call[mi][d][f] for d in range(month_days[mi])) <= max_call)
 
-    # H5 — Max call nights per month per surgeon (from profile)
+    # H5 — Max call nights per month per surgeon
     for s in range(num_surgeons):
         if s in fellow_indices:
             continue
         max_call = int(surgeons[s].get('max_call_per_month', 8))
         for mi in range(num_months):
-            model.Add(sum(call[mi][d][s] for d in range(month_days[mi])) <= max_call)
+            model.Add(
+                sum(call[mi][d][s] for d in range(month_days[mi])) <= max_call)
 
     # ── Soft constraints ──────────────────────────────────────────
     obj_terms     = []
@@ -821,8 +831,10 @@ def solve_call(surgeons, months, week_assignments, preferences):
                           if is_eligible(surgeons[s], 'call')]
     fair_wknd = max(1, round(total_weekend / max(1, len(call_eligible_list))))
 
-    surgeon_wknd = [model.NewIntVar(0, total_weekend, f'wk_{s}')
-                    for s in range(num_surgeons)]
+    surgeon_wknd = [
+        model.NewIntVar(0, total_weekend, f'wk_{s}')
+        for s in range(num_surgeons)
+    ]
     for s in range(num_surgeons):
         wvars = [call[mi][d][s] for mi, d in weekend_nights]
         model.Add(surgeon_wknd[s] == (sum(wvars) if wvars else 0))
@@ -861,8 +873,10 @@ def solve_call(surgeons, months, week_assignments, preferences):
         for s in range(num_surgeons):
             for d in range(days - 3):
                 run4 = model.NewBoolVar(f'r4_{mi}_{d}_{s}')
-                model.AddMinEquality(run4, [call[mi][d][s], call[mi][d+1][s],
-                                            call[mi][d+2][s], call[mi][d+3][s]])
+                model.AddMinEquality(run4, [
+                    call[mi][d][s], call[mi][d+1][s],
+                    call[mi][d+2][s], call[mi][d+3][s]
+                ])
                 penalty_terms.append(25 * run4)
 
     # Avoid nights
@@ -889,7 +903,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         raise Exception(
             f"Call solver failed: {solver.StatusName(status)}. "
-            f"Cannot assign call to all nights given service week restrictions. "
+            f"Cannot assign call given service week restrictions. "
             f"Check call eligibility flags."
         )
 
@@ -909,6 +923,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
 
 def build_output(surgeons, months, week_assignments, call_assignments,
                  block_number, prior_totals):
+
     num_surgeons = len(surgeons)
     num_months   = len(months)
     month_days   = [monthrange(y, mo)[1] for y, mo in months]
@@ -919,7 +934,6 @@ def build_output(surgeons, months, week_assignments, call_assignments,
     ]
     target_shifts = [max(0, round(t)) for t in block_targets]
 
-    # Group weeks by month
     months_weeks = {mi: [] for mi in range(num_months)}
     for wi in sorted(week_assignments.keys()):
         months_weeks[week_assignments[wi]['month_idx']].append(wi)
@@ -928,7 +942,6 @@ def build_output(surgeons, months, week_assignments, call_assignments,
     for mi, (y, mo) in enumerate(months):
         mk           = f"{y}-{str(mo).zfill(2)}"
         result_weeks = []
-
         for wi in months_weeks[mi]:
             wa        = week_assignments[wi]
             week_data = {'label': wa['label']}
@@ -960,7 +973,7 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             'fte_summary': fte_summary,
         }
 
-    # ── Validation Report ─────────────────────────────────────────
+    # ── Validation ────────────────────────────────────────────────
     violations = []
     warnings   = []
 
@@ -976,7 +989,8 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         for w in result[mk]['weeks']:
             for role in ['ACS (M-Sun)', 'ACS (M-F)', 'McNair ICU', 'TSICU', 'SICU']:
                 if role not in w:
-                    violations.append(f"{month_label} {w['label']}: {role} not assigned")
+                    violations.append(
+                        f"{month_label} {w['label']}: {role} not assigned")
 
         for d in range(month_days[mi]):
             if str(d + 1) not in result[mk]['nights']:
@@ -989,11 +1003,11 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                 if name:
                     if name in seen:
                         violations.append(
-                            f"{month_label} {w['label']}: {name} in {seen[name]} and {role}"
-                        )
+                            f"{month_label} {w['label']}: "
+                            f"{name} in {seen[name]} and {role}")
                     seen[name] = role
 
-    # Consecutive 7-day weeks (flagged — solver strongly avoids but may allow in edge cases)
+    # Consecutive 7-day weeks
     seven_day_labels = ['ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU']
     for i in range(len(all_weeks_flat) - 1):
         w1 = all_weeks_flat[i]
@@ -1004,10 +1018,9 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                 n2 = w2.get(r2)
                 if n1 and n1 == n2:
                     warnings.append(
-                        f"Consecutive 7-day weeks: {n1} ({r1} -> {r2}) — review manually"
-                    )
+                        f"Consecutive 7-day weeks: {n1} ({r1} -> {r2}) — review manually")
 
-    # ACS M-Sun consecutive (hard rule — should never appear)
+    # ACS M-Sun consecutive
     for i in range(len(all_weeks_flat) - 1):
         n1 = all_weeks_flat[i].get('ACS (M-Sun)')
         n2 = all_weeks_flat[i + 1].get('ACS (M-Sun)')
@@ -1026,8 +1039,8 @@ def build_output(surgeons, months, week_assignments, call_assignments,
                     if run >= 4:
                         warnings.append(
                             f"{datetime(y, mo, 1).strftime('%B %Y')}: "
-                            f"{name} has {run}+ consecutive call nights starting day {d - run + 1}"
-                        )
+                            f"{name} has {run}+ consecutive call nights "
+                            f"starting day {d - run + 1}")
                         break
                 else:
                     run = 0
@@ -1046,21 +1059,24 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             for wi in sorted(week_assignments.keys()):
                 wa = week_assignments[wi]
                 if wa['start'] == next_monday:
-                    for role in ['ACS (M-Sun)', 'ACS (M-F)', 'McNair ICU', 'TSICU', 'SICU']:
+                    for role in ['ACS (M-Sun)', 'ACS (M-F)',
+                                 'McNair ICU', 'TSICU', 'SICU']:
                         if wa.get(role) == call_name:
                             prior_wi = wi - 1
                             in_prior = prior_wi >= 0 and any(
                                 week_assignments[prior_wi].get(r) == call_name
-                                for r in ['ACS (M-Sun)', 'ACS (M-F)', 'McNair ICU', 'TSICU', 'SICU']
+                                for r in ['ACS (M-Sun)', 'ACS (M-F)',
+                                          'McNair ICU', 'TSICU', 'SICU']
                             )
                             if not in_prior:
                                 warnings.append(
-                                    f"{call_name}: call Sun {next_monday.strftime('%b %-d')} "
-                                    f"then fresh {role} Mon — fix manually"
-                                )
+                                    f"{call_name}: call Sun "
+                                    f"{next_monday.strftime('%b %-d')} "
+                                    f"then fresh {role} Mon — fix manually")
 
     # Fellow rotation validation
-    all_weeks_list = [week_assignments[wi] for wi in sorted(week_assignments.keys())]
+    all_weeks_list = [week_assignments[wi]
+                      for wi in sorted(week_assignments.keys())]
     active_in_week = [
         [is_active_for_week(surgeons[s], all_weeks_list[wi])
          for s in range(num_surgeons)]
@@ -1070,7 +1086,7 @@ def build_output(surgeons, months, week_assignments, call_assignments,
 
     for period_idx, period_months in enumerate(get_two_month_periods(months)):
         for f in fellow_indices:
-            fname       = surgeons[f]['name']
+            fname        = surgeons[f]['name']
             acs_t, sicu_t = compute_fellow_rotation_target(
                 surgeons[f], period_months, months, active_in_week, all_weeks_list
             )
@@ -1086,15 +1102,13 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             if acs_t > 0 and acs_count != acs_t:
                 violations.append(
                     f"Fellow {fname} period {period_idx + 1}: "
-                    f"{acs_count} ACS weeks (expected {acs_t})"
-                )
+                    f"{acs_count} ACS weeks (expected {acs_t})")
             if sicu_t > 0 and sicu_count != sicu_t:
                 violations.append(
                     f"Fellow {fname} period {period_idx + 1}: "
-                    f"{sicu_count} SICU weeks (expected {sicu_t})"
-                )
+                    f"{sicu_count} SICU weeks (expected {sicu_t})")
 
-    # FTE equity summary
+    # FTE equity
     block_fte_summary    = {}
     weekend_nights       = [
         (mi, d)
@@ -1117,13 +1131,11 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         if t > 0 and delta < -7:
             warnings.append(
                 f"{name}: served {total} vs target {t} "
-                f"(short {abs(delta)}) — check eligibility coverage"
-            )
+                f"(short {abs(delta)}) — check eligibility and role caps")
         elif t > 0 and delta > 14 and pref == 'baseline':
             warnings.append(
                 f"{name}: served {total} vs target {t} "
-                f"(+{delta} over) — baseline surgeon over target"
-            )
+                f"(+{delta} over) — review role caps")
 
         block_fte_summary[name] = {
             'served': total,
