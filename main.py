@@ -221,10 +221,18 @@ def is_active_for_month(surgeon, year, month):
 
 
 def is_fellow(surgeon):
-    # Reads is_fellow boolean from Supabase via payload.
-    # Never uses name strings. To add a fellow: set
-    # is_fellow = true in the surgeons table. No code changes needed.
-    return surgeon.get('is_fellow') is True
+    if surgeon.get('is_fellow') is True:
+        return True
+    # Fallback: check start_date exists and fte is 0.5
+    # Fellows always have a start_date and 0.5 FTE
+    has_start = bool(surgeon.get('start_date'))
+    half_fte = float(surgeon.get('fte', 1.0)) == 0.5
+    can_sicu = bool(surgeon.get('covers_sicu'))
+    can_acs = bool(surgeon.get('can_acs'))
+    no_mcnair = not bool(surgeon.get('covers_mcnair'))
+    no_tsicu = not bool(surgeon.get('covers_tsicu'))
+    return has_start and half_fte and can_sicu and can_acs and no_mcnair and no_tsicu
+
 
 
 
