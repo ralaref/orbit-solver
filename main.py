@@ -221,12 +221,11 @@ def is_active_for_month(surgeon, year, month):
 
 
 def is_fellow(surgeon):
-    # FIX v18: Use explicit is_fellow flag from payload.
-    # Falls back to name-string check only as a safety net.
-    # The route.ts sends is_fellow: true for fellows explicitly.
-    if surgeon.get('is_fellow') is True:
-        return True
-    return 'fellow' in surgeon.get('name', '').lower()
+    # Reads is_fellow boolean from Supabase via payload.
+    # Never uses name strings. To add a fellow: set
+    # is_fellow = true in the surgeons table. No code changes needed.
+    return surgeon.get('is_fellow') is True
+
 
 
 def get_pref(surgeon):
