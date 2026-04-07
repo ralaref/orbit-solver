@@ -1,12 +1,8 @@
 """
-ORbit Surgical Scheduling Solver v18
+ORbit Surgical Scheduling Solver v19
 =====================================
-Core principle: A schedule must ALWAYS be complete.
-No role goes unfilled. No night goes uncovered.
-
-v18 change: Fellow detection now uses explicit is_fellow flag from payload
-instead of name-string matching. Fixes silent FTE summary failures for
-Mortus and Todd when their Supabase names don't contain the word 'fellow'.
+v19: Force rebuild. is_fellow uses DB flag + eligibility fallback.
+Debug print added to confirm fellow detection on every solve.
 """
 
 from flask import Flask, request, jsonify
@@ -18,10 +14,6 @@ import os
 
 app = Flask(__name__)
 CORS(app)
-
-# ─────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────
 
 ANNUAL_FTE_SHIFTS = 168
 BLOCK_FTE_SHIFTS  = 84
@@ -43,18 +35,10 @@ ROLE_SHIFTS = {
 ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
 
 
-# ─────────────────────────────────────────────────────────────────
-# HEALTH
-# ─────────────────────────────────────────────────────────────────
-
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v18'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v19'})
 
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINT
-# ─────────────────────────────────────────────────────────────────
 
 @app.route('/solve-block', methods=['POST'])
 def solve_block():
@@ -78,6 +62,11 @@ def solve_block():
 
         for i, s in enumerate(surgeons):
             s['_idx'] = i
+
+        # DEBUG — confirm what the solver received for is_fellow
+        print("=== v19 SOLVER STARTED ===", flush=True)
+        for s in surgeons:
+            print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
 
         week_assignments = greedy_service_weeks(
             surgeons=surgeons,
@@ -113,10 +102,6 @@ def solve_block():
             'trace': traceback.format_exc()
         }), 500
 
-
-# ─────────────────────────────────────────────────────────────────
-# WEEK UTILITIES
-# ─────────────────────────────────────────────────────────────────
 
 def get_all_weeks(months):
     seen  = set()
@@ -159,10 +144,6 @@ def get_all_weeks(months):
 def get_two_month_periods(months):
     return [[months[i], months[i + 1]] for i in range(0, 6, 2)]
 
-
-# ─────────────────────────────────────────────────────────────────
-# SURGEON HELPERS
-# ─────────────────────────────────────────────────────────────────
 
 def is_eligible(surgeon, role):
     role_map = {
@@ -221,19 +202,19 @@ def is_active_for_month(surgeon, year, month):
 
 
 def is_fellow(surgeon):
+    # Primary: explicit DB flag
     if surgeon.get('is_fellow') is True:
         return True
-    # Fallback: check start_date exists and fte is 0.5
-    # Fellows always have a start_date and 0.5 FTE
-    has_start = bool(surgeon.get('start_date'))
-    half_fte = float(surgeon.get('fte', 1.0)) == 0.5
-    can_sicu = bool(surgeon.get('covers_sicu'))
-    can_acs = bool(surgeon.get('can_acs'))
-    no_mcnair = not bool(surgeon.get('covers_mcnair'))
-    no_tsicu = not bool(surgeon.get('covers_tsicu'))
+    # Fallback: unique eligibility combination
+    # Fellows are the only surgeons with:
+    # SICU + ACS + no McNair + no TSICU + a start_date + 0.5 FTE
+    has_start  = bool(surgeon.get('start_date'))
+    half_fte   = abs(float(surgeon.get('fte', 1.0)) - 0.5) < 0.01
+    can_sicu   = bool(surgeon.get('covers_sicu'))
+    can_acs    = bool(surgeon.get('can_acs'))
+    no_mcnair  = not bool(surgeon.get('covers_mcnair'))
+    no_tsicu   = not bool(surgeon.get('covers_tsicu'))
     return has_start and half_fte and can_sicu and can_acs and no_mcnair and no_tsicu
-
-
 
 
 def get_pref(surgeon):
@@ -243,10 +224,6 @@ def get_pref(surgeon):
 def is_seven_day_role(role):
     return role in ('ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU')
 
-
-# ─────────────────────────────────────────────────────────────────
-# FTE TARGET & CAPS
-# ─────────────────────────────────────────────────────────────────
 
 def compute_block_target(surgeon, block_number, prior_totals, months):
     fte    = float(surgeon.get('fte', 1.0))
@@ -293,10 +270,6 @@ def compute_soft_cap(target_shifts, pref):
     multiplier = {'baseline': 1.0, 'willing': 1.4, 'seeking': 1.8}.get(pref, 1.0)
     return round(target_shifts * multiplier)
 
-
-# ─────────────────────────────────────────────────────────────────
-# PREFERENCE PARSING
-# ─────────────────────────────────────────────────────────────────
 
 def get_surgeon_prefs(surgeon_id, preferences):
     for p in preferences:
@@ -353,10 +326,6 @@ def day_in_dates(year, month, day_0indexed, date_set):
         return False
 
 
-# ─────────────────────────────────────────────────────────────────
-# FELLOW ROTATION
-# ─────────────────────────────────────────────────────────────────
-
 def compute_fellow_period_targets(fellows, periods, all_weeks):
     result = {}
     for fellow in fellows:
@@ -377,16 +346,14 @@ def compute_fellow_period_targets(fellows, periods, all_weeks):
     return result
 
 
-# ─────────────────────────────────────────────────────────────────
-# GREEDY SERVICE WEEK SOLVER
-# ─────────────────────────────────────────────────────────────────
-
 def greedy_service_weeks(surgeons, months, block_number, preferences, prior_totals):
     all_weeks = get_all_weeks(months)
     periods   = get_two_month_periods(months)
 
     fellows   = [s for s in surgeons if is_fellow(s)]
     all_names = [s['name'] for s in surgeons]
+
+    print(f"DEBUG fellows detected: {[f['name'] for f in fellows]}", flush=True)
 
     surgeon_time_off = {}
     for s in surgeons:
@@ -396,14 +363,16 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
         conf  = parse_date_list(prefs.get('conferences', ''), y_ref)
         surgeon_time_off[s['name']] = off | conf
 
-    targets  = {}
+    targets   = {}
     soft_caps = {}
     for s in surgeons:
-        t                  = compute_block_target(s, block_number, prior_totals, months)
-        t_int              = max(0, round(t))
-        pref               = get_pref(s)
+        t                    = compute_block_target(s, block_number, prior_totals, months)
+        t_int                = max(0, round(t))
+        pref                 = get_pref(s)
         targets[s['name']]   = t_int
         soft_caps[s['name']] = compute_soft_cap(t_int, pref)
+
+    print("DEBUG targets:", {k: v for k, v in targets.items()}, flush=True)
 
     surgeon_active_weeks = {
         s['name']: sum(1 for w in all_weeks if is_active_for_week(s, w))
@@ -574,10 +543,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
 
     return week_assignments
 
-
-# ─────────────────────────────────────────────────────────────────
-# SOLVER 2 — CALL (OR-Tools CP-SAT)
-# ─────────────────────────────────────────────────────────────────
 
 def solve_call(surgeons, months, week_assignments, preferences):
     num_surgeons   = len(surgeons)
@@ -759,10 +724,6 @@ def solve_call(surgeons, months, week_assignments, preferences):
 
     return call_assignments
 
-
-# ─────────────────────────────────────────────────────────────────
-# OUTPUT BUILDER
-# ─────────────────────────────────────────────────────────────────
 
 def build_output(surgeons, months, week_assignments, call_assignments,
                  block_number, prior_totals):
@@ -996,10 +957,6 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         }
     }
 
-
-# ─────────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
