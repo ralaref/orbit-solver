@@ -1,8 +1,10 @@
 """
-ORbit Surgical Scheduling Solver v19
+ORbit Surgical Scheduling Solver v20
 =====================================
-v19: Force rebuild. is_fellow uses DB flag + eligibility fallback.
-Debug print added to confirm fellow detection on every solve.
+v20: Block target = 84 × FTE for every block, always.
+No carry-forward from Block 1. Every shift over target
+is compensation, tracked independently per block.
+Prorated only for start/departure dates.
 """
 
 from flask import Flask, request, jsonify
@@ -37,7 +39,7 @@ ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v19'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v20'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -63,8 +65,7 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        # DEBUG — confirm what the solver received for is_fellow
-        print("=== v19 SOLVER STARTED ===", flush=True)
+        print("=== v20 SOLVER STARTED ===", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
 
@@ -202,12 +203,8 @@ def is_active_for_month(surgeon, year, month):
 
 
 def is_fellow(surgeon):
-    # Primary: explicit DB flag
     if surgeon.get('is_fellow') is True:
         return True
-    # Fallback: unique eligibility combination
-    # Fellows are the only surgeons with:
-    # SICU + ACS + no McNair + no TSICU + a start_date + 0.5 FTE
     has_start  = bool(surgeon.get('start_date'))
     half_fte   = abs(float(surgeon.get('fte', 1.0)) - 0.5) < 0.01
     can_sicu   = bool(surgeon.get('covers_sicu'))
@@ -226,40 +223,42 @@ def is_seven_day_role(role):
 
 
 def compute_block_target(surgeon, block_number, prior_totals, months):
-    fte    = float(surgeon.get('fte', 1.0))
-    annual = ANNUAL_FTE_SHIFTS * fte
+    """
+    Block target = 84 × FTE for every block, always.
+    No carry-forward from Block 1. Every shift over target
+    is compensation, tracked independently per block.
+    prior_totals kept for API compatibility but ignored.
+    Prorated only for start/departure dates.
+    """
+    fte          = float(surgeon.get('fte', 1.0))
+    block_target = BLOCK_FTE_SHIFTS * fte
 
-    if block_number == 1:
-        block_target = BLOCK_FTE_SHIFTS * fte
-    else:
-        prior        = float(prior_totals.get(surgeon.get('name', ''), 0))
-        block_target = max(0.0, annual - prior)
+    block_start = datetime(months[0][0], months[0][1], 1)
+    last        = monthrange(months[-1][0], months[-1][1])[1]
+    block_end   = datetime(months[-1][0], months[-1][1], last)
+    total_days  = (block_end - block_start).days + 1
 
     start_str = surgeon.get('start_date') or ''
     if start_str:
         try:
-            sd          = datetime.strptime(start_str[:10], '%Y-%m-%d')
-            block_start = datetime(months[0][0], months[0][1], 1)
-            last        = monthrange(months[-1][0], months[-1][1])[1]
-            block_end   = datetime(months[-1][0], months[-1][1], last)
+            sd = datetime.strptime(start_str[:10], '%Y-%m-%d')
+            if sd > block_end:
+                return 0.0
             if sd > block_start:
-                total        = (block_end - block_start).days + 1
                 active       = max(0, (block_end - sd).days + 1)
-                block_target = block_target * (active / total)
+                block_target = block_target * (active / total_days)
         except Exception:
             pass
 
     depart_str = surgeon.get('departure_date') or ''
     if depart_str:
         try:
-            dd          = datetime.strptime(depart_str[:10], '%Y-%m-%d')
-            block_start = datetime(months[0][0], months[0][1], 1)
-            last        = monthrange(months[-1][0], months[-1][1])[1]
-            block_end   = datetime(months[-1][0], months[-1][1], last)
+            dd = datetime.strptime(depart_str[:10], '%Y-%m-%d')
+            if dd < block_start:
+                return 0.0
             if dd < block_end:
-                total        = (block_end - block_start).days + 1
                 active       = max(0, (dd - block_start).days + 1)
-                block_target = block_target * (active / total)
+                block_target = block_target * (active / total_days)
         except Exception:
             pass
 
