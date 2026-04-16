@@ -66,6 +66,7 @@ def solve_block():
             s['_idx'] = i
 
         print("=== v20 SOLVER STARTED ===", flush=True)
+        print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
 
@@ -353,6 +354,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
     all_names = [s['name'] for s in surgeons]
 
     print(f"DEBUG fellows detected: {[f['name'] for f in fellows]}", flush=True)
+    print(f"DEBUG total weeks generated: {len(all_weeks)}", flush=True)
 
     surgeon_time_off = {}
     for s in surgeons:
@@ -372,6 +374,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
         soft_caps[s['name']] = compute_soft_cap(t_int, pref)
 
     print("DEBUG targets:", {k: v for k, v in targets.items()}, flush=True)
+    print("DEBUG soft_caps:", {k: v for k, v in soft_caps.items()}, flush=True)
 
     surgeon_active_weeks = {
         s['name']: sum(1 for w in all_weeks if is_active_for_week(s, w))
@@ -478,6 +481,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
 
     for wi, week in enumerate(all_weeks):
         assigned_this_week = {}
+        print(f"DEBUG week {wi}: {week['label']} month_idx={week['month_idx']} year={week['year']} month={week['month']}", flush=True)
 
         for s in surgeons:
             if is_active_for_week(s, week):
@@ -521,6 +525,8 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
                 best = fallback_candidates[0][2]
                 assigned_this_week[role] = best['name']
 
+        print(f"DEBUG week {wi} assigned: {assigned_this_week}", flush=True)
+
         for role, name in assigned_this_week.items():
             surgeon = next((s for s in surgeons if s['name'] == name), None)
             if surgeon is None:
@@ -540,6 +546,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
                         fellow_sicu_served[name][pi] += 1
             week_assignments[wi][role] = name
 
+    print(f"DEBUG final served: {served}", flush=True)
     return week_assignments
 
 
