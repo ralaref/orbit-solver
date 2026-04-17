@@ -1,6 +1,12 @@
 """
-ORbit Surgical Scheduling Solver v20
+ORbit Surgical Scheduling Solver v21
 =====================================
+v21: Surgeon ranked time-off week preferences now applied
+as soft penalties in pace_score. Rank 1-2 = strong penalty,
+Rank 3-4 = moderate, Rank 5+ = light. Holiday weeks get
+1.5x penalty multiplier. Preferences are soft only —
+all roles must be filled regardless.
+
 v20: Block target = 84 × FTE for every block, always.
 No carry-forward from Block 1. Every shift over target
 is compensation, tracked independently per block.
@@ -39,7 +45,7 @@ ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v20'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v21'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -65,7 +71,7 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v20 SOLVER STARTED ===", flush=True)
+        print("=== v21 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
@@ -224,13 +230,6 @@ def is_seven_day_role(role):
 
 
 def compute_block_target(surgeon, block_number, prior_totals, months):
-    """
-    Block target = 84 × FTE for every block, always.
-    No carry-forward from Block 1. Every shift over target
-    is compensation, tracked independently per block.
-    prior_totals kept for API compatibility but ignored.
-    Prorated only for start/departure dates.
-    """
     fte          = float(surgeon.get('fte', 1.0))
     block_target = BLOCK_FTE_SHIFTS * fte
 
@@ -356,6 +355,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
     print(f"DEBUG fellows detected: {[f['name'] for f in fellows]}", flush=True)
     print(f"DEBUG total weeks generated: {len(all_weeks)}", flush=True)
 
+    # ── Build time-off sets (legacy free-text, kept for compatibility) ────────
     surgeon_time_off = {}
     for s in surgeons:
         prefs = get_surgeon_prefs(s.get('id', ''), preferences)
@@ -363,6 +363,29 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
         off   = parse_date_list(prefs.get('time_off',    ''), y_ref)
         conf  = parse_date_list(prefs.get('conferences', ''), y_ref)
         surgeon_time_off[s['name']] = off | conf
+
+    # ── Build ranked week preference dict (new structured format) ─────────────
+    # surgeon_week_ranks[surgeon_name][week_label] = {rank, is_holiday}
+    surgeon_week_ranks = {}
+    for s in surgeons:
+        prefs          = get_surgeon_prefs(s.get('id', ''), preferences)
+        time_off_weeks = prefs.get('time_off_weeks', [])
+        if isinstance(time_off_weeks, list) and time_off_weeks:
+            surgeon_week_ranks[s['name']] = {
+                w.get('week', ''): {
+                    'rank':       int(w.get('rank', 99)),
+                    'is_holiday': bool(w.get('isHoliday', False)),
+                }
+                for w in time_off_weeks
+                if w.get('week')
+            }
+            print(
+                f"DEBUG {s['name']} time_off_weeks: "
+                f"{list(surgeon_week_ranks[s['name']].keys())}",
+                flush=True
+            )
+        else:
+            surgeon_week_ranks[s['name']] = {}
 
     targets   = {}
     soft_caps = {}
@@ -452,7 +475,9 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
         budget       = t * (so_far / total_active) if total_active > 0 else 0
         pace_deficit = (budget - served[name]) / t
         rest         = min((wi - last_service_wi[name]) * 0.08, 0.4)
-        pref_adj = 0.0
+        pref_adj     = 0.0
+
+        # Over-target penalty by preference tier
         if served[name] >= t:
             if pref == 'willing':
                 pref_adj = 0.1
@@ -460,6 +485,24 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
                 pref_adj = 0.2
             else:
                 pref_adj = -0.8
+
+        # ── Ranked time-off week penalty (v21) ────────────────────────────────
+        # Reduces score for weeks surgeon has requested off.
+        # Penalty scales with rank (1=strongest) and holiday multiplier.
+        # This is a soft constraint — role must still be filled if no one else
+        # is available (fallback pass ignores this and assigns anyway).
+        week_label = all_weeks[wi]['label'] if wi < len(all_weeks) else ''
+        week_info  = surgeon_week_ranks.get(name, {}).get(week_label)
+        if week_info:
+            rank         = week_info['rank']
+            holiday_mult = 1.5 if week_info['is_holiday'] else 1.0
+            if rank <= 2:
+                pref_adj -= 0.6 * holiday_mult
+            elif rank <= 4:
+                pref_adj -= 0.35 * holiday_mult
+            else:
+                pref_adj -= 0.15 * holiday_mult
+
         return pace_deficit + rest + pref_adj
 
     def fallback_score(surgeon):
@@ -487,6 +530,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
             if is_active_for_week(s, week):
                 active_so_far[s['name']] += 1
 
+        # Pass 1 — Fellows get priority for their rotation requirements
         for role in ROLE_ORDER:
             if role in assigned_this_week:
                 continue
@@ -498,6 +542,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
                         assigned_this_week[role] = fellow['name']
                         break
 
+        # Pass 2 — Within-cap greedy with pace + preference scoring
         for role in ROLE_ORDER:
             if role in assigned_this_week:
                 continue
@@ -512,6 +557,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
                 best = candidates[0][2]
                 assigned_this_week[role] = best['name']
 
+        # Pass 3 — Fallback: assign least-loaded eligible regardless of cap
         for role in ROLE_ORDER:
             if role in assigned_this_week:
                 continue
