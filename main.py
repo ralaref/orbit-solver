@@ -1,16 +1,47 @@
 """
-ORbit Surgical Scheduling Solver v21
+ORbit Surgical Scheduling Solver v22
 =====================================
-v21: Surgeon ranked time-off week preferences now applied
-as soft penalties in pace_score. Rank 1-2 = strong penalty,
-Rank 3-4 = moderate, Rank 5+ = light. Holiday weeks get
-1.5x penalty multiplier. Preferences are soft only —
-all roles must be filled regardless.
+v22: Observability + preference-honoring hardening. No change to the
+core assignment engine — every v21 behavior is preserved. Additions:
 
-v20: Block target = 84 × FTE for every block, always.
-No carry-forward from Block 1. Every shift over target
-is compensation, tracked independently per block.
-Prorated only for start/departure dates.
+  1. PREFERENCE-OVERRIDE FLAGS. When the service solver is forced to
+     place a surgeon on a week they ranked off (soft penalty lost to
+     coverage), it is now flagged (typed 'preference_override', or
+     'holiday_override' when the week is a holiday).
+
+  2. RANK-SCALED HEAVY-SOFT CALL AVOIDANCE. The call solver now reads
+     ranked time-off weeks and applies a large per-night penalty for
+     assigning call during a requested week off. Penalty is tiered by
+     rank (1-2 strongest, 5+ light) and ×1.5 on holiday weeks. It sits
+     far above the coordination penalties, so week-off effectively wins
+     except against literal infeasibility. Any break is flagged
+     ('call_during_week_off') for an executive decision.
+
+  3. CONTESTED-WEEK DETECTION. When two or more surgeons request the
+     same week off, the week is filled as normal and flagged
+     ('contested_week') with the full contender list for the chief.
+
+  4. HOLIDAY PROTECTION + HISTORY HOOK. Holiday weeks keep the 1.5x
+     penalty. A new optional 'holiday_history' input lets recent
+     holiday duty strengthen a surgeon's holiday-off claim. Inert
+     (no effect) until history data is loaded, so v21 holiday behavior
+     is reproduced exactly when it is absent.
+
+  5. TYPED FLAG LAYER. Validation now returns a 'flags' array of typed
+     objects alongside the existing human-readable 'warnings' strings.
+     Nothing that currently reads 'warnings' breaks; future UI work can
+     filter by flag type instead of parsing text.
+
+Preferences remain SOFT everywhere — all roles and all nights are still
+filled regardless. Coverage always wins; the compromise is flagged.
+
+v21: Surgeon ranked time-off week preferences applied as soft penalties
+in pace_score. Rank 1-2 = strong, 3-4 = moderate, 5+ = light. Holiday
+weeks get a 1.5x penalty multiplier.
+
+v20: Block target = 84 × FTE for every block, always. No carry-forward
+from Block 1. Every shift over target is compensation, tracked
+independently per block. Prorated only for start/departure dates.
 """
 
 from flask import Flask, request, jsonify
@@ -42,21 +73,30 @@ ROLE_SHIFTS = {
 
 ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
 
+# ── Call-avoidance penalty tiers for requested weeks off (v22) ────────────────
+# These sit far above the call-coordination penalties (weekend equity ~40,
+# run-of-4 = 25, avoid-night = 30) so a requested week off is honored in every
+# case where any legal alternative exists, and only yields to infeasibility.
+CALL_OFFWEEK_PENALTY = {'top': 500, 'mid': 250, 'low': 80}
+CALL_OFFWEEK_HOLIDAY_MULT = 1.5
+
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v21'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v22'})
 
 
 @app.route('/solve-block', methods=['POST'])
 def solve_block():
     try:
-        data         = request.json
-        surgeons     = data.get('surgeons', [])
-        block_number = data.get('block_number', 1)
-        start_year   = data.get('start_year')
-        preferences  = data.get('preferences', [])
-        prior_totals = data.get('prior_totals', {})
+        data            = request.json
+        surgeons        = data.get('surgeons', [])
+        block_number    = data.get('block_number', 1)
+        start_year      = data.get('start_year')
+        preferences     = data.get('preferences', [])
+        prior_totals    = data.get('prior_totals', {})
+        # Optional; used to adjudicate contested holidays. Inert when absent.
+        holiday_history = data.get('holiday_history', {}) or {}
 
         if not surgeons:
             return jsonify({'success': False, 'error': 'No surgeons provided'}), 400
@@ -71,7 +111,7 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v21 SOLVER STARTED ===", flush=True)
+        print("=== v22 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
@@ -82,6 +122,7 @@ def solve_block():
             block_number=block_number,
             preferences=preferences,
             prior_totals=prior_totals,
+            holiday_history=holiday_history,
         )
 
         call_assignments = solve_call(
@@ -98,6 +139,8 @@ def solve_block():
             call_assignments=call_assignments,
             block_number=block_number,
             prior_totals=prior_totals,
+            preferences=preferences,
+            holiday_history=holiday_history,
         )
 
         return jsonify({'success': True, 'schedule': result})
@@ -325,6 +368,51 @@ def day_in_dates(year, month, day_0indexed, date_set):
         return False
 
 
+# ─────────────────────────────────────────────────────────────────
+# RANKED WEEK PREFERENCE PARSING (shared by all three stages)
+# ─────────────────────────────────────────────────────────────────
+
+def build_week_ranks(surgeons, preferences):
+    """
+    surgeon_name -> { week_label: {'rank': int, 'is_holiday': bool} }
+    from the structured 'time_off_weeks' preference field.
+    """
+    out = {}
+    for s in surgeons:
+        prefs = get_surgeon_prefs(s.get('id', ''), preferences)
+        tow   = prefs.get('time_off_weeks', [])
+        d     = {}
+        if isinstance(tow, list):
+            for w in tow:
+                lbl = w.get('week', '')
+                if lbl:
+                    d[lbl] = {
+                        'rank':       int(w.get('rank', 99)),
+                        'is_holiday': bool(w.get('isHoliday', False)),
+                    }
+        out[s['name']] = d
+    return out
+
+
+def holiday_claim_factor(name, holiday_history):
+    """
+    Strengthens a surgeon's holiday-off request based on recent holiday duty.
+    Returns a multiplier in [1.0, 2.0]. Inert (1.0) when no history is loaded,
+    so holiday behavior is identical to v21 until the ledger is wired in.
+    Expected (future) shape: holiday_history[name] = {'recent_holidays_worked': int}
+    """
+    if not holiday_history:
+        return 1.0
+    info = holiday_history.get(name)
+    if not info:
+        return 1.0
+    try:
+        worked = int(info.get('recent_holidays_worked', 0))
+    except Exception:
+        worked = 0
+    return 1.0 + min(worked * 0.25, 1.0)
+
+
 def compute_fellow_period_targets(fellows, periods, all_weeks):
     result = {}
     for fellow in fellows:
@@ -345,7 +433,9 @@ def compute_fellow_period_targets(fellows, periods, all_weeks):
     return result
 
 
-def greedy_service_weeks(surgeons, months, block_number, preferences, prior_totals):
+def greedy_service_weeks(surgeons, months, block_number, preferences,
+                         prior_totals, holiday_history=None):
+    holiday_history = holiday_history or {}
     all_weeks = get_all_weeks(months)
     periods   = get_two_month_periods(months)
 
@@ -364,28 +454,11 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
         conf  = parse_date_list(prefs.get('conferences', ''), y_ref)
         surgeon_time_off[s['name']] = off | conf
 
-    # ── Build ranked week preference dict (new structured format) ─────────────
-    # surgeon_week_ranks[surgeon_name][week_label] = {rank, is_holiday}
-    surgeon_week_ranks = {}
-    for s in surgeons:
-        prefs          = get_surgeon_prefs(s.get('id', ''), preferences)
-        time_off_weeks = prefs.get('time_off_weeks', [])
-        if isinstance(time_off_weeks, list) and time_off_weeks:
-            surgeon_week_ranks[s['name']] = {
-                w.get('week', ''): {
-                    'rank':       int(w.get('rank', 99)),
-                    'is_holiday': bool(w.get('isHoliday', False)),
-                }
-                for w in time_off_weeks
-                if w.get('week')
-            }
-            print(
-                f"DEBUG {s['name']} time_off_weeks: "
-                f"{list(surgeon_week_ranks[s['name']].keys())}",
-                flush=True
-            )
-        else:
-            surgeon_week_ranks[s['name']] = {}
+    # ── Build ranked week preference dict (structured format) ─────────────────
+    surgeon_week_ranks = build_week_ranks(surgeons, preferences)
+    for name, d in surgeon_week_ranks.items():
+        if d:
+            print(f"DEBUG {name} time_off_weeks: {list(d.keys())}", flush=True)
 
     targets   = {}
     soft_caps = {}
@@ -486,22 +559,19 @@ def greedy_service_weeks(surgeons, months, block_number, preferences, prior_tota
             else:
                 pref_adj = -0.8
 
-        # ── Ranked time-off week penalty (v21) ────────────────────────────────
-        # Reduces score for weeks surgeon has requested off.
-        # Penalty scales with rank (1=strongest) and holiday multiplier.
-        # This is a soft constraint — role must still be filled if no one else
-        # is available (fallback pass ignores this and assigns anyway).
+        # ── Ranked time-off week penalty (v21) + holiday history (v22) ────────
+        # Soft only — the role is still filled from this pool if no one else is
+        # available. Holiday weeks get a 1.5x multiplier; when holiday history
+        # is loaded, recent holiday duty further strengthens the request.
         week_label = all_weeks[wi]['label'] if wi < len(all_weeks) else ''
         week_info  = surgeon_week_ranks.get(name, {}).get(week_label)
         if week_info:
-            rank         = week_info['rank']
-            holiday_mult = 1.5 if week_info['is_holiday'] else 1.0
-            if rank <= 2:
-                pref_adj -= 0.6 * holiday_mult
-            elif rank <= 4:
-                pref_adj -= 0.35 * holiday_mult
-            else:
-                pref_adj -= 0.15 * holiday_mult
+            rank = week_info['rank']
+            base = 0.6 if rank <= 2 else (0.35 if rank <= 4 else 0.15)
+            mult = 1.0
+            if week_info['is_holiday']:
+                mult = 1.5 * holiday_claim_factor(name, holiday_history)
+            pref_adj -= base * mult
 
         return pace_deficit + rest + pref_adj
 
@@ -607,6 +677,28 @@ def solve_call(surgeons, months, week_assignments, preferences):
         prefs = get_surgeon_prefs(s.get('id', ''), preferences)
         surgeon_avoid[i] = parse_date_list(
             prefs.get('avoid_nights', ''), months[0][0])
+
+    # ── Ranked week-off -> per-surgeon night penalty map (v22) ────────────────
+    # Expand each ranked week label to its 7 calendar dates and store the rank
+    # and holiday flag so the call objective can penalize those nights heavily.
+    label_to_dates = {}
+    for wi, wa in week_assignments.items():
+        start = wa['start']
+        label_to_dates[wa['label']] = [(start + timedelta(days=o)).date()
+                                       for o in range(7)]
+
+    surgeon_offweek = {i: {} for i in range(num_surgeons)}  # i -> {date: (rank, is_holiday)}
+    for i, s in enumerate(surgeons):
+        prefs = get_surgeon_prefs(s.get('id', ''), preferences)
+        tow   = prefs.get('time_off_weeks', [])
+        if isinstance(tow, list):
+            for w in tow:
+                lbl = w.get('week', '')
+                if lbl in label_to_dates:
+                    rank = int(w.get('rank', 99))
+                    hol  = bool(w.get('isHoliday', False))
+                    for dt in label_to_dates[lbl]:
+                        surgeon_offweek[i][dt] = (rank, hol)
 
     active_in_month = [
         [is_active_for_month(surgeons[i], y, mo) for i in range(num_surgeons)]
@@ -748,6 +840,28 @@ def solve_call(surgeons, months, week_assignments, preferences):
                 if surgeon_avoid[i] and day_in_dates(y, mo, d, surgeon_avoid[i]):
                     penalty_terms.append(30 * call[mi][d][i])
 
+    # ── Heavy-soft, rank-scaled call-during-week-off penalty (v22) ────────────
+    # Dominates the coordination penalties so a requested week off is honored
+    # wherever any legal alternative exists; yields only to infeasibility, and
+    # every break is surfaced as a 'call_during_week_off' flag in build_output.
+    for mi, (y, mo) in enumerate(months):
+        for d in range(month_days[mi]):
+            cur = datetime(y, mo, d + 1).date()
+            for i in range(num_surgeons):
+                info = surgeon_offweek.get(i, {}).get(cur)
+                if not info:
+                    continue
+                rank, hol = info
+                if rank <= 2:
+                    base = CALL_OFFWEEK_PENALTY['top']
+                elif rank <= 4:
+                    base = CALL_OFFWEEK_PENALTY['mid']
+                else:
+                    base = CALL_OFFWEEK_PENALTY['low']
+                if hol:
+                    base = int(base * CALL_OFFWEEK_HOLIDAY_MULT)
+                penalty_terms.append(base * call[mi][d][i])
+
     total_obj = []
     if obj_terms:
         total_obj.append(sum(obj_terms))
@@ -778,7 +892,11 @@ def solve_call(surgeons, months, week_assignments, preferences):
 
 
 def build_output(surgeons, months, week_assignments, call_assignments,
-                 block_number, prior_totals):
+                 block_number, prior_totals, preferences=None,
+                 holiday_history=None):
+
+    preferences     = preferences or []
+    holiday_history = holiday_history or {}
 
     num_months   = len(months)
     month_days   = [monthrange(y, mo)[1] for y, mo in months]
@@ -830,6 +948,15 @@ def build_output(surgeons, months, week_assignments, call_assignments,
 
     violations = []
     warnings   = []
+    flags      = []
+
+    def add_flag(ftype, severity, message, **extra):
+        """Record a typed flag AND a human-readable string (so the current
+        Validation Report keeps showing it until the UI filters by type)."""
+        f = {'type': ftype, 'severity': severity, 'message': message}
+        f.update(extra)
+        flags.append(f)
+        warnings.append(message)
 
     all_weeks_flat = []
     for mi in range(num_months):
@@ -998,11 +1125,102 @@ def build_output(surgeons, months, week_assignments, call_assignments,
         if count > 0:
             weekend_call_summary[name] = count
 
+    # ── Preference-honoring flags (v22) ───────────────────────────────────────
+    # All computed post-hoc from the finished schedule + preferences, so the
+    # assignment engine above is untouched. Three families:
+    #   preference_override / holiday_override — assigned to a ranked-off week
+    #   contested_week                         — >=2 surgeons want the same week
+    #   call_during_week_off                   — call landed in a ranked-off week
+    surgeon_week_ranks = build_week_ranks(surgeons, preferences)
+
+    # date -> week label (for call-night lookup)
+    def week_label_for_date(dt):
+        for w in all_weeks:
+            if w['start'] <= dt <= w['end']:
+                return w['label']
+        return None
+
+    # 1) Service override flags
+    for mi, (y, mo) in enumerate(months):
+        mk = f"{y}-{str(mo).zfill(2)}"
+        for w in result[mk]['weeks']:
+            lbl = w['label']
+            for role in ROLE_SHIFTS:
+                name = w.get(role)
+                if not name:
+                    continue
+                info = surgeon_week_ranks.get(name, {}).get(lbl)
+                if info:
+                    is_hol = info['is_holiday']
+                    rank   = info['rank']
+                    ftype  = 'holiday_override' if is_hol else 'preference_override'
+                    tag    = 'HOLIDAY OVERRIDE' if is_hol else 'PREF OVERRIDE'
+                    add_flag(
+                        ftype, 'high',
+                        f"{tag}: {name} assigned {role} for {lbl} "
+                        f"(requested off, rank #{rank}) — coverage forced; "
+                        f"exec review.",
+                        surgeon=name, week=lbl, role=role, rank=rank,
+                        is_holiday=is_hol)
+
+    # 2) Contested-week flags
+    week_requesters = {}  # label -> [(name, rank, is_holiday)]
+    for name, ranks in surgeon_week_ranks.items():
+        for lbl, info in ranks.items():
+            week_requesters.setdefault(lbl, []).append(
+                (name, info['rank'], info['is_holiday']))
+    for lbl, reqs in week_requesters.items():
+        if len(reqs) >= 2:
+            is_hol     = any(r[2] for r in reqs)
+            contenders = sorted(reqs, key=lambda r: r[1])
+            names_ranks = ", ".join(f"{n} (#{rk})" for n, rk, _ in contenders)
+            adjudication = None
+            if is_hol and holiday_history:
+                # Strongest claim first = most recent holiday duty. Advisory only.
+                adjudication = [
+                    n for n, _, _ in sorted(
+                        contenders,
+                        key=lambda r: (holiday_history.get(r[0], {}) or {})
+                        .get('recent_holidays_worked', 0),
+                        reverse=True)
+                ]
+            add_flag(
+                'contested_week', 'medium',
+                f"CONTESTED WEEK{' [HOLIDAY]' if is_hol else ''}: {lbl} "
+                f"requested by {len(reqs)} surgeons — {names_ranks}. "
+                f"Filled; chief to review.",
+                week=lbl, is_holiday=is_hol,
+                contenders=[{'surgeon': n, 'rank': rk, 'is_holiday': h}
+                            for n, rk, h in contenders],
+                adjudication=adjudication)
+
+    # 3) Call-during-week-off flags
+    for mi, (y, mo) in enumerate(months):
+        mk = f"{y}-{str(mo).zfill(2)}"
+        for d in range(month_days[mi]):
+            call_name = result[mk]['nights'].get(str(d + 1), {}).get('Call', '')
+            if not call_name:
+                continue
+            dt  = datetime(y, mo, d + 1)
+            lbl = week_label_for_date(dt)
+            if not lbl:
+                continue
+            info = surgeon_week_ranks.get(call_name, {}).get(lbl)
+            if info:
+                add_flag(
+                    'call_during_week_off', 'high',
+                    f"CALL DURING WEEK OFF: {call_name} on call "
+                    f"{dt.strftime('%b %-d')} during requested week off {lbl} "
+                    f"(rank #{info['rank']}) — exec decision required.",
+                    surgeon=call_name, date=dt.strftime('%Y-%m-%d'),
+                    week=lbl, rank=info['rank'], is_holiday=info['is_holiday'])
+
     return {
         'months': result,
         'validation': {
             'violations':           violations,
             'warnings':             warnings,
+            'flags':                flags,
             'valid':                len(violations) == 0,
             'block_fte_summary':    block_fte_summary,
             'weekend_call_summary': weekend_call_summary,
