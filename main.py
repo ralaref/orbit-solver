@@ -1,47 +1,27 @@
 """
-ORbit Surgical Scheduling Solver v22
+ORbit Surgical Scheduling Solver v23
 =====================================
-v22: Observability + preference-honoring hardening. No change to the
-core assignment engine — every v21 behavior is preserved. Additions:
+v23: CHECK-ONLY MODE (no change to the optimizer or to any flag rule).
+All flag/violation/warning logic is extracted into a single shared
+function, validate_schedule(). Two callers now use it:
 
-  1. PREFERENCE-OVERRIDE FLAGS. When the service solver is forced to
-     place a surgeon on a week they ranked off (soft penalty lost to
-     coverage), it is now flagged (typed 'preference_override', or
-     'holiday_override' when the week is a holiday).
+  - build_output() runs it at the end of a full solve (identical output
+    to v22 — same flags, same warnings, same numbers).
+  - a NEW '/validate-only' endpoint runs ONLY that function against a
+    schedule the app sends, with no optimizing. It returns the same
+    'validation' shape in a fraction of a second.
 
-  2. RANK-SCALED HEAVY-SOFT CALL AVOIDANCE. The call solver now reads
-     ranked time-off weeks and applies a large per-night penalty for
-     assigning call during a requested week off. Penalty is tiered by
-     rank (1-2 strongest, 5+ light) and ×1.5 on holiday weeks. It sits
-     far above the coordination penalties, so week-off effectively wins
-     except against literal infeasibility. Any break is flagged
-     ('call_during_week_off') for an executive decision.
+This lets the app re-check a hand-edited schedule instantly (e.g. right
+after applying a suggested swap) without re-solving the whole block, and
+keeps the rules in ONE place so the app and solver can never disagree.
 
-  3. CONTESTED-WEEK DETECTION. When two or more surgeons request the
-     same week off, the week is filled as normal and flagged
-     ('contested_week') with the full contender list for the chief.
+v22: Observability + preference-honoring hardening. Preference-override
+flags, rank-scaled heavy-soft call avoidance, contested-week detection,
+holiday protection + history hook, and a typed 'flags' layer. Preferences
+remain SOFT everywhere — all roles/nights filled; the compromise is flagged.
 
-  4. HOLIDAY PROTECTION + HISTORY HOOK. Holiday weeks keep the 1.5x
-     penalty. A new optional 'holiday_history' input lets recent
-     holiday duty strengthen a surgeon's holiday-off claim. Inert
-     (no effect) until history data is loaded, so v21 holiday behavior
-     is reproduced exactly when it is absent.
-
-  5. TYPED FLAG LAYER. Validation now returns a 'flags' array of typed
-     objects alongside the existing human-readable 'warnings' strings.
-     Nothing that currently reads 'warnings' breaks; future UI work can
-     filter by flag type instead of parsing text.
-
-Preferences remain SOFT everywhere — all roles and all nights are still
-filled regardless. Coverage always wins; the compromise is flagged.
-
-v21: Surgeon ranked time-off week preferences applied as soft penalties
-in pace_score. Rank 1-2 = strong, 3-4 = moderate, 5+ = light. Holiday
-weeks get a 1.5x penalty multiplier.
-
-v20: Block target = 84 × FTE for every block, always. No carry-forward
-from Block 1. Every shift over target is compensation, tracked
-independently per block. Prorated only for start/departure dates.
+v21: Ranked time-off week preferences as soft penalties in pace_score.
+v20: Block target = 84 × FTE for every block; over-target is compensation.
 """
 
 from flask import Flask, request, jsonify
@@ -74,16 +54,13 @@ ROLE_SHIFTS = {
 ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
 
 # ── Call-avoidance penalty tiers for requested weeks off (v22) ────────────────
-# These sit far above the call-coordination penalties (weekend equity ~40,
-# run-of-4 = 25, avoid-night = 30) so a requested week off is honored in every
-# case where any legal alternative exists, and only yields to infeasibility.
 CALL_OFFWEEK_PENALTY = {'top': 500, 'mid': 250, 'low': 80}
 CALL_OFFWEEK_HOLIDAY_MULT = 1.5
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v22'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v23'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -95,7 +72,6 @@ def solve_block():
         start_year      = data.get('start_year')
         preferences     = data.get('preferences', [])
         prior_totals    = data.get('prior_totals', {})
-        # Optional; used to adjudicate contested holidays. Inert when absent.
         holiday_history = data.get('holiday_history', {}) or {}
 
         if not surgeons:
@@ -111,7 +87,7 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v22 SOLVER STARTED ===", flush=True)
+        print("=== v23 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
@@ -144,6 +120,50 @@ def solve_block():
         )
 
         return jsonify({'success': True, 'schedule': result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'trace': traceback.format_exc()
+        }), 500
+
+
+@app.route('/validate-only', methods=['POST'])
+def validate_only():
+    """
+    Fast check-only mode. Runs validate_schedule() against a schedule the app
+    sends (already assembled: months -> weeks/nights), with NO optimizing.
+    Returns the same 'validation' shape as a full solve, in well under a second.
+    """
+    try:
+        data            = request.json or {}
+        schedule        = data.get('schedule', {})     # {month_key: {weeks, nights}}
+        surgeons        = data.get('surgeons', [])
+        block_number    = data.get('block_number', 1)
+        start_year      = data.get('start_year')
+        preferences     = data.get('preferences', [])
+        prior_totals    = data.get('prior_totals', {})
+        holiday_history = data.get('holiday_history', {}) or {}
+
+        if not schedule:
+            return jsonify({'success': False, 'error': 'No schedule provided'}), 400
+        if not surgeons:
+            return jsonify({'success': False, 'error': 'No surgeons provided'}), 400
+        if not start_year:
+            return jsonify({'success': False, 'error': 'start_year required'}), 400
+
+        if block_number == 1:
+            months = [(start_year, m) for m in BLOCK1_MONTHS]
+        else:
+            months = [(start_year + 1, m) for m in BLOCK2_MONTHS]
+
+        validation = validate_schedule(
+            schedule, surgeons, months, block_number, prior_totals,
+            preferences=preferences, holiday_history=holiday_history)
+
+        return jsonify({'success': True, 'validation': validation})
 
     except Exception as e:
         import traceback
@@ -193,7 +213,9 @@ def get_all_weeks(months):
 
 
 def get_two_month_periods(months):
-    return [[months[i], months[i + 1]] for i in range(0, 6, 2)]
+    # For a real block this is exactly [(0,1),(2,3),(4,5)]. Guard against
+    # shorter month lists so check-only never index-errors on partial input.
+    return [[months[i], months[i + 1]] for i in range(0, len(months) - 1, 2)]
 
 
 def is_eligible(surgeon, role):
@@ -369,14 +391,11 @@ def day_in_dates(year, month, day_0indexed, date_set):
 
 
 # ─────────────────────────────────────────────────────────────────
-# RANKED WEEK PREFERENCE PARSING (shared by all three stages)
+# RANKED WEEK PREFERENCE PARSING (shared by all stages)
 # ─────────────────────────────────────────────────────────────────
 
 def build_week_ranks(surgeons, preferences):
-    """
-    surgeon_name -> { week_label: {'rank': int, 'is_holiday': bool} }
-    from the structured 'time_off_weeks' preference field.
-    """
+    """surgeon_name -> { week_label: {'rank': int, 'is_holiday': bool} }"""
     out = {}
     for s in surgeons:
         prefs = get_surgeon_prefs(s.get('id', ''), preferences)
@@ -395,12 +414,6 @@ def build_week_ranks(surgeons, preferences):
 
 
 def holiday_claim_factor(name, holiday_history):
-    """
-    Strengthens a surgeon's holiday-off request based on recent holiday duty.
-    Returns a multiplier in [1.0, 2.0]. Inert (1.0) when no history is loaded,
-    so holiday behavior is identical to v21 until the ledger is wired in.
-    Expected (future) shape: holiday_history[name] = {'recent_holidays_worked': int}
-    """
     if not holiday_history:
         return 1.0
     info = holiday_history.get(name)
@@ -445,7 +458,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
     print(f"DEBUG fellows detected: {[f['name'] for f in fellows]}", flush=True)
     print(f"DEBUG total weeks generated: {len(all_weeks)}", flush=True)
 
-    # ── Build time-off sets (legacy free-text, kept for compatibility) ────────
     surgeon_time_off = {}
     for s in surgeons:
         prefs = get_surgeon_prefs(s.get('id', ''), preferences)
@@ -454,7 +466,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         conf  = parse_date_list(prefs.get('conferences', ''), y_ref)
         surgeon_time_off[s['name']] = off | conf
 
-    # ── Build ranked week preference dict (structured format) ─────────────────
     surgeon_week_ranks = build_week_ranks(surgeons, preferences)
     for name, d in surgeon_week_ranks.items():
         if d:
@@ -550,7 +561,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         rest         = min((wi - last_service_wi[name]) * 0.08, 0.4)
         pref_adj     = 0.0
 
-        # Over-target penalty by preference tier
         if served[name] >= t:
             if pref == 'willing':
                 pref_adj = 0.1
@@ -559,10 +569,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
             else:
                 pref_adj = -0.8
 
-        # ── Ranked time-off week penalty (v21) + holiday history (v22) ────────
-        # Soft only — the role is still filled from this pool if no one else is
-        # available. Holiday weeks get a 1.5x multiplier; when holiday history
-        # is loaded, recent holiday duty further strengthens the request.
         week_label = all_weeks[wi]['label'] if wi < len(all_weeks) else ''
         week_info  = surgeon_week_ranks.get(name, {}).get(week_label)
         if week_info:
@@ -600,7 +606,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
             if is_active_for_week(s, week):
                 active_so_far[s['name']] += 1
 
-        # Pass 1 — Fellows get priority for their rotation requirements
         for role in ROLE_ORDER:
             if role in assigned_this_week:
                 continue
@@ -612,7 +617,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
                         assigned_this_week[role] = fellow['name']
                         break
 
-        # Pass 2 — Within-cap greedy with pace + preference scoring
         for role in ROLE_ORDER:
             if role in assigned_this_week:
                 continue
@@ -627,7 +631,6 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
                 best = candidates[0][2]
                 assigned_this_week[role] = best['name']
 
-        # Pass 3 — Fallback: assign least-loaded eligible regardless of cap
         for role in ROLE_ORDER:
             if role in assigned_this_week:
                 continue
@@ -678,16 +681,13 @@ def solve_call(surgeons, months, week_assignments, preferences):
         surgeon_avoid[i] = parse_date_list(
             prefs.get('avoid_nights', ''), months[0][0])
 
-    # ── Ranked week-off -> per-surgeon night penalty map (v22) ────────────────
-    # Expand each ranked week label to its 7 calendar dates and store the rank
-    # and holiday flag so the call objective can penalize those nights heavily.
     label_to_dates = {}
     for wi, wa in week_assignments.items():
         start = wa['start']
         label_to_dates[wa['label']] = [(start + timedelta(days=o)).date()
                                        for o in range(7)]
 
-    surgeon_offweek = {i: {} for i in range(num_surgeons)}  # i -> {date: (rank, is_holiday)}
+    surgeon_offweek = {i: {} for i in range(num_surgeons)}
     for i, s in enumerate(surgeons):
         prefs = get_surgeon_prefs(s.get('id', ''), preferences)
         tow   = prefs.get('time_off_weeks', [])
@@ -840,10 +840,6 @@ def solve_call(surgeons, months, week_assignments, preferences):
                 if surgeon_avoid[i] and day_in_dates(y, mo, d, surgeon_avoid[i]):
                     penalty_terms.append(30 * call[mi][d][i])
 
-    # ── Heavy-soft, rank-scaled call-during-week-off penalty (v22) ────────────
-    # Dominates the coordination penalties so a requested week off is honored
-    # wherever any legal alternative exists; yields only to infeasibility, and
-    # every break is surfaced as a 'call_during_week_off' flag in build_output.
     for mi, (y, mo) in enumerate(months):
         for d in range(month_days[mi]):
             cur = datetime(y, mo, d + 1).date()
@@ -891,6 +887,319 @@ def solve_call(surgeons, months, week_assignments, preferences):
     return call_assignments
 
 
+def validate_schedule(result, surgeons, months, block_number, prior_totals,
+                      preferences=None, holiday_history=None):
+    """
+    THE single source of truth for flags/violations/warnings.
+    Operates purely on an assembled schedule (`result`: {month_key: {weeks,
+    nights}}), so it works identically for a fresh solve and for a hand-edited
+    schedule sent by the app. No optimizing here — only checking.
+    """
+    preferences     = preferences or []
+    holiday_history = holiday_history or {}
+
+    num_months = len(months)
+    month_days = [monthrange(y, mo)[1] for y, mo in months]
+
+    block_targets = {
+        s['name']: compute_block_target(s, block_number, prior_totals, months)
+        for s in surgeons
+    }
+    target_shifts = {name: max(0, round(t)) for name, t in block_targets.items()}
+
+    all_weeks = get_all_weeks(months)
+
+    # Ordered weeks (chronological) with their assignments pulled from `result`
+    # by label. Replaces the internal week_assignments dict for adjacency checks.
+    label_to_week = {}
+    for mk, md in result.items():
+        for w in (md.get('weeks') or []):
+            if w.get('label'):
+                label_to_week[w['label']] = w
+    ordered = [{'start': w['start'], 'end': w['end'], 'label': w['label'],
+                'assign': label_to_week.get(w['label'], {})} for w in all_weeks]
+    start_to_idx = {w['start']: i for i, w in enumerate(ordered)}
+
+    # Flat chronological list of week dicts (for consecutive-week checks)
+    all_weeks_flat = []
+    for mi in range(num_months):
+        mk = f"{months[mi][0]}-{str(months[mi][1]).zfill(2)}"
+        all_weeks_flat.extend((result.get(mk, {}) or {}).get('weeks', []) or [])
+
+    # Recompute served totals from the schedule itself (robust to hand edits)
+    served_total = {s['name']: 0 for s in surgeons}
+    for w in all_weeks_flat:
+        for role, sc in ROLE_SHIFTS.items():
+            n = w.get(role)
+            if n in served_total:
+                served_total[n] += sc
+
+    violations = []
+    warnings   = []
+    flags      = []
+
+    def add_flag(ftype, severity, message, **extra):
+        f = {'type': ftype, 'severity': severity, 'message': message}
+        f.update(extra)
+        flags.append(f)
+        warnings.append(message)
+
+    # ── Structural violations: unfilled roles, missing call, double-booking ──
+    for mi, (y, mo) in enumerate(months):
+        mk          = f"{y}-{str(mo).zfill(2)}"
+        month_label = datetime(y, mo, 1).strftime('%B %Y')
+        md          = result.get(mk, {}) or {}
+        weeks       = md.get('weeks', []) or []
+        nights      = md.get('nights', {}) or {}
+
+        for w in weeks:
+            for role in ROLE_SHIFTS:
+                if not w.get(role):
+                    violations.append(
+                        f"{month_label} {w.get('label','?')}: {role} unfilled — "
+                        f"no eligible surgeon found")
+
+        for d in range(month_days[mi]):
+            if not nights.get(str(d + 1), {}).get('Call'):
+                violations.append(
+                    f"{month_label} day {d + 1}: No call surgeon assigned")
+
+        for w in weeks:
+            seen = {}
+            for role in ROLE_SHIFTS:
+                name = w.get(role)
+                if name:
+                    if name in seen:
+                        violations.append(
+                            f"{month_label} {w.get('label','?')}: "
+                            f"{name} in {seen[name]} and {role}")
+                    seen[name] = role
+
+    # ── Consecutive 7-day service weeks (warning) ──
+    seven_day_roles = ['ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU']
+    for i in range(len(all_weeks_flat) - 1):
+        w1 = all_weeks_flat[i]
+        w2 = all_weeks_flat[i + 1]
+        for r1 in seven_day_roles:
+            for r2 in seven_day_roles:
+                n1 = w1.get(r1)
+                n2 = w2.get(r2)
+                if n1 and n2 and n1 == n2:
+                    warnings.append(
+                        f"Consecutive 7-day weeks: {n1} "
+                        f"({r1} -> {r2}) — review manually")
+
+    # ── ACS M-Sun consecutive (hard violation) ──
+    for i in range(len(all_weeks_flat) - 1):
+        n1 = all_weeks_flat[i].get('ACS (M-Sun)')
+        n2 = all_weeks_flat[i + 1].get('ACS (M-Sun)')
+        if n1 and n2 and n1 == n2:
+            violations.append(f"ACS M-Sun consecutive: {n1} — hard rule violated")
+
+    # ── 4+ consecutive call nights (warning) ──
+    for mi, (y, mo) in enumerate(months):
+        nights = (result.get(f"{y}-{str(mo).zfill(2)}", {}) or {}).get('nights', {}) or {}
+        for s in surgeons:
+            name = s['name']
+            run  = 0
+            for d in range(1, month_days[mi] + 1):
+                if nights.get(str(d), {}).get('Call') == name:
+                    run += 1
+                    if run >= 4:
+                        warnings.append(
+                            f"{datetime(y, mo, 1).strftime('%B %Y')}: "
+                            f"{name} has {run}+ consecutive call nights "
+                            f"starting day {d - run + 1}")
+                        break
+                else:
+                    run = 0
+
+    # ── Sunday call then fresh Monday service (warning) ──
+    for mi, (y, mo) in enumerate(months):
+        nights = (result.get(f"{y}-{str(mo).zfill(2)}", {}) or {}).get('nights', {}) or {}
+        for d in range(month_days[mi]):
+            if datetime(y, mo, d + 1).weekday() != 6:
+                continue
+            call_name = nights.get(str(d + 1), {}).get('Call', '')
+            if not call_name:
+                continue
+            next_monday = datetime(y, mo, d + 1) + timedelta(days=1)
+            idx = start_to_idx.get(next_monday)
+            if idx is None:
+                continue
+            wa = ordered[idx]['assign']
+            for role in ROLE_SHIFTS:
+                if wa.get(role) == call_name:
+                    prior = ordered[idx - 1]['assign'] if idx - 1 >= 0 else {}
+                    in_prior = any(prior.get(r) == call_name for r in ROLE_SHIFTS)
+                    if not in_prior:
+                        warnings.append(
+                            f"{call_name}: call Sun "
+                            f"{next_monday.strftime('%b %-d')} "
+                            f"then fresh {role} Mon — fix manually")
+
+    # ── Fellow rotation quotas (violation) ──
+    periods = get_two_month_periods(months)
+    fellows = [s for s in surgeons if is_fellow(s)]
+    fpt     = compute_fellow_period_targets(fellows, periods, all_weeks)
+
+    for pi, period_months in enumerate(periods):
+        for fellow in fellows:
+            fname         = fellow['name']
+            acs_t, sicu_t = fpt[fname].get(pi, (0, 0))
+            acs_count = sicu_count = 0
+            for pm in period_months:
+                mk = f"{pm[0]}-{str(pm[1]).zfill(2)}"
+                for w in (result.get(mk, {}) or {}).get('weeks', []) or []:
+                    if w.get('ACS (M-F)')   == fname: acs_count  += 1
+                    if w.get('ACS (M-Sun)') == fname: acs_count  += 1
+                    if w.get('SICU')        == fname: sicu_count += 1
+            if acs_t > 0 and acs_count != acs_t:
+                violations.append(
+                    f"Fellow {fname} period {pi + 1}: "
+                    f"{acs_count} ACS weeks (expected {acs_t})")
+            if sicu_t > 0 and sicu_count != sicu_t:
+                violations.append(
+                    f"Fellow {fname} period {pi + 1}: "
+                    f"{sicu_count} SICU weeks (expected {sicu_t})")
+
+    # ── FTE / compensation summary (warnings + block summary) ──
+    weekend_nights = [
+        (mi, d)
+        for mi, (y, mo) in enumerate(months)
+        for d in range(month_days[mi])
+        if datetime(y, mo, d + 1).weekday() >= 4
+    ]
+
+    block_fte_summary    = {}
+    weekend_call_summary = {}
+
+    for s in surgeons:
+        name  = s['name']
+        pref  = get_pref(s)
+        total = served_total.get(name, 0)
+        t     = target_shifts[name]
+        cap   = compute_soft_cap(t, pref)
+        delta = total - t
+
+        if t > 0 and total > cap:
+            warnings.append(
+                f"{name}: served {total} shifts (cap {cap}, target {t}) — "
+                f"assigned beyond cap to cover unfilled roles. "
+                f"Review for compensation.")
+        elif t > 0 and delta < -7:
+            warnings.append(
+                f"{name}: served {total} vs target {t} "
+                f"(short {abs(delta)}) — insufficient eligible coverage")
+
+        block_fte_summary[name] = {
+            'served': total,
+            'target': round(block_targets[name], 1),
+            'delta':  round(delta, 1),
+        }
+
+        count = sum(
+            1 for mi, d in weekend_nights
+            if (result.get(f"{months[mi][0]}-{str(months[mi][1]).zfill(2)}", {}) or {})
+               .get('nights', {}).get(str(d + 1), {}).get('Call') == name
+        )
+        if count > 0:
+            weekend_call_summary[name] = count
+
+    # ── Preference-honoring flags (typed) ──
+    surgeon_week_ranks = build_week_ranks(surgeons, preferences)
+
+    def week_label_for_date(dt):
+        for w in all_weeks:
+            if w['start'] <= dt <= w['end']:
+                return w['label']
+        return None
+
+    # 1) Service overrides
+    for mi, (y, mo) in enumerate(months):
+        mk = f"{y}-{str(mo).zfill(2)}"
+        for w in (result.get(mk, {}) or {}).get('weeks', []) or []:
+            lbl = w.get('label')
+            for role in ROLE_SHIFTS:
+                name = w.get(role)
+                if not name or not lbl:
+                    continue
+                info = surgeon_week_ranks.get(name, {}).get(lbl)
+                if info:
+                    is_hol = info['is_holiday']
+                    rank   = info['rank']
+                    ftype  = 'holiday_override' if is_hol else 'preference_override'
+                    tag    = 'HOLIDAY OVERRIDE' if is_hol else 'PREF OVERRIDE'
+                    add_flag(
+                        ftype, 'high',
+                        f"{tag}: {name} assigned {role} for {lbl} "
+                        f"(requested off, rank #{rank}) — coverage forced; "
+                        f"exec review.",
+                        surgeon=name, week=lbl, role=role, rank=rank,
+                        is_holiday=is_hol)
+
+    # 2) Contested weeks
+    week_requesters = {}
+    for name, ranks in surgeon_week_ranks.items():
+        for lbl, info in ranks.items():
+            week_requesters.setdefault(lbl, []).append(
+                (name, info['rank'], info['is_holiday']))
+    for lbl, reqs in week_requesters.items():
+        if len(reqs) >= 2:
+            is_hol      = any(r[2] for r in reqs)
+            contenders  = sorted(reqs, key=lambda r: r[1])
+            names_ranks = ", ".join(f"{n} (#{rk})" for n, rk, _ in contenders)
+            adjudication = None
+            if is_hol and holiday_history:
+                adjudication = [
+                    n for n, _, _ in sorted(
+                        contenders,
+                        key=lambda r: (holiday_history.get(r[0], {}) or {})
+                        .get('recent_holidays_worked', 0),
+                        reverse=True)
+                ]
+            add_flag(
+                'contested_week', 'medium',
+                f"CONTESTED WEEK{' [HOLIDAY]' if is_hol else ''}: {lbl} "
+                f"requested by {len(reqs)} surgeons — {names_ranks}. "
+                f"Filled; chief to review.",
+                week=lbl, is_holiday=is_hol,
+                contenders=[{'surgeon': n, 'rank': rk, 'is_holiday': h}
+                            for n, rk, h in contenders],
+                adjudication=adjudication)
+
+    # 3) Call during a requested week off
+    for mi, (y, mo) in enumerate(months):
+        mk     = f"{y}-{str(mo).zfill(2)}"
+        nights = (result.get(mk, {}) or {}).get('nights', {}) or {}
+        for d in range(month_days[mi]):
+            call_name = nights.get(str(d + 1), {}).get('Call', '')
+            if not call_name:
+                continue
+            dt  = datetime(y, mo, d + 1)
+            lbl = week_label_for_date(dt)
+            if not lbl:
+                continue
+            info = surgeon_week_ranks.get(call_name, {}).get(lbl)
+            if info:
+                add_flag(
+                    'call_during_week_off', 'high',
+                    f"CALL DURING WEEK OFF: {call_name} on call "
+                    f"{dt.strftime('%b %-d')} during requested week off {lbl} "
+                    f"(rank #{info['rank']}) — exec decision required.",
+                    surgeon=call_name, date=dt.strftime('%Y-%m-%d'),
+                    week=lbl, rank=info['rank'], is_holiday=info['is_holiday'])
+
+    return {
+        'violations':           violations,
+        'warnings':             warnings,
+        'flags':                flags,
+        'valid':                len(violations) == 0,
+        'block_fte_summary':    block_fte_summary,
+        'weekend_call_summary': weekend_call_summary,
+    }
+
+
 def build_output(surgeons, months, week_assignments, call_assignments,
                  block_number, prior_totals, preferences=None,
                  holiday_history=None):
@@ -898,16 +1207,8 @@ def build_output(surgeons, months, week_assignments, call_assignments,
     preferences     = preferences or []
     holiday_history = holiday_history or {}
 
-    num_months   = len(months)
-    month_days   = [monthrange(y, mo)[1] for y, mo in months]
-
-    block_targets = {
-        s['name']: compute_block_target(s, block_number, prior_totals, months)
-        for s in surgeons
-    }
-    target_shifts = {
-        name: max(0, round(t)) for name, t in block_targets.items()
-    }
+    num_months = len(months)
+    month_days = [monthrange(y, mo)[1] for y, mo in months]
 
     months_weeks = {mi: [] for mi in range(num_months)}
     for wi in sorted(week_assignments.keys()):
@@ -946,286 +1247,12 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             'fte_summary': fte_summary,
         }
 
-    violations = []
-    warnings   = []
-    flags      = []
+    # Single source of truth — same function the /validate-only endpoint uses.
+    validation = validate_schedule(
+        result, surgeons, months, block_number, prior_totals,
+        preferences=preferences, holiday_history=holiday_history)
 
-    def add_flag(ftype, severity, message, **extra):
-        """Record a typed flag AND a human-readable string (so the current
-        Validation Report keeps showing it until the UI filters by type)."""
-        f = {'type': ftype, 'severity': severity, 'message': message}
-        f.update(extra)
-        flags.append(f)
-        warnings.append(message)
-
-    all_weeks_flat = []
-    for mi in range(num_months):
-        mk = f"{months[mi][0]}-{str(months[mi][1]).zfill(2)}"
-        all_weeks_flat.extend(result[mk]['weeks'])
-
-    for mi, (y, mo) in enumerate(months):
-        mk          = f"{y}-{str(mo).zfill(2)}"
-        month_label = datetime(y, mo, 1).strftime('%B %Y')
-
-        for w in result[mk]['weeks']:
-            for role in ROLE_SHIFTS:
-                if not w.get(role):
-                    violations.append(
-                        f"{month_label} {w['label']}: {role} unfilled — "
-                        f"no eligible surgeon found")
-
-        for d in range(month_days[mi]):
-            if not result[mk]['nights'].get(str(d + 1), {}).get('Call'):
-                violations.append(
-                    f"{month_label} day {d + 1}: No call surgeon assigned")
-
-        for w in result[mk]['weeks']:
-            seen = {}
-            for role in ROLE_SHIFTS:
-                name = w.get(role)
-                if name:
-                    if name in seen:
-                        violations.append(
-                            f"{month_label} {w['label']}: "
-                            f"{name} in {seen[name]} and {role}")
-                    seen[name] = role
-
-    seven_day_roles = ['ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU']
-    for i in range(len(all_weeks_flat) - 1):
-        w1 = all_weeks_flat[i]
-        w2 = all_weeks_flat[i + 1]
-        for r1 in seven_day_roles:
-            for r2 in seven_day_roles:
-                n1 = w1.get(r1)
-                n2 = w2.get(r2)
-                if n1 and n2 and n1 == n2:
-                    warnings.append(
-                        f"Consecutive 7-day weeks: {n1} "
-                        f"({r1} -> {r2}) — review manually")
-
-    for i in range(len(all_weeks_flat) - 1):
-        n1 = all_weeks_flat[i].get('ACS (M-Sun)')
-        n2 = all_weeks_flat[i + 1].get('ACS (M-Sun)')
-        if n1 and n2 and n1 == n2:
-            violations.append(f"ACS M-Sun consecutive: {n1} — hard rule violated")
-
-    for mi, (y, mo) in enumerate(months):
-        nights = result[f"{y}-{str(mo).zfill(2)}"]['nights']
-        for s in surgeons:
-            name = s['name']
-            run  = 0
-            for d in range(1, month_days[mi] + 1):
-                if nights.get(str(d), {}).get('Call') == name:
-                    run += 1
-                    if run >= 4:
-                        warnings.append(
-                            f"{datetime(y, mo, 1).strftime('%B %Y')}: "
-                            f"{name} has {run}+ consecutive call nights "
-                            f"starting day {d - run + 1}")
-                        break
-                else:
-                    run = 0
-
-    for mi, (y, mo) in enumerate(months):
-        for d in range(month_days[mi]):
-            if datetime(y, mo, d + 1).weekday() != 6:
-                continue
-            call_name = result[f"{y}-{str(mo).zfill(2)}"]['nights'].get(
-                str(d + 1), {}
-            ).get('Call', '')
-            if not call_name:
-                continue
-            next_monday = datetime(y, mo, d + 1) + timedelta(days=1)
-            for wi in sorted(week_assignments.keys()):
-                wa = week_assignments[wi]
-                if wa['start'] == next_monday:
-                    for role in ROLE_SHIFTS:
-                        if wa.get(role) == call_name:
-                            prior_wi = wi - 1
-                            in_prior = prior_wi >= 0 and any(
-                                week_assignments[prior_wi].get(r) == call_name
-                                for r in ROLE_SHIFTS
-                            )
-                            if not in_prior:
-                                warnings.append(
-                                    f"{call_name}: call Sun "
-                                    f"{next_monday.strftime('%b %-d')} "
-                                    f"then fresh {role} Mon — fix manually")
-
-    all_weeks  = get_all_weeks(months)
-    periods    = get_two_month_periods(months)
-    fellows    = [s for s in surgeons if is_fellow(s)]
-    fpt        = compute_fellow_period_targets(fellows, periods, all_weeks)
-
-    for pi, period_months in enumerate(periods):
-        for fellow in fellows:
-            fname         = fellow['name']
-            acs_t, sicu_t = fpt[fname].get(pi, (0, 0))
-            acs_count = sicu_count = 0
-            for pm in period_months:
-                mk = f"{pm[0]}-{str(pm[1]).zfill(2)}"
-                if mk not in result:
-                    continue
-                for w in result[mk]['weeks']:
-                    if w.get('ACS (M-F)')   == fname: acs_count  += 1
-                    if w.get('ACS (M-Sun)') == fname: acs_count  += 1
-                    if w.get('SICU')        == fname: sicu_count += 1
-            if acs_t > 0 and acs_count != acs_t:
-                violations.append(
-                    f"Fellow {fname} period {pi + 1}: "
-                    f"{acs_count} ACS weeks (expected {acs_t})")
-            if sicu_t > 0 and sicu_count != sicu_t:
-                violations.append(
-                    f"Fellow {fname} period {pi + 1}: "
-                    f"{sicu_count} SICU weeks (expected {sicu_t})")
-
-    weekend_nights = [
-        (mi, d)
-        for mi, (y, mo) in enumerate(months)
-        for d in range(month_days[mi])
-        if datetime(y, mo, d + 1).weekday() >= 4
-    ]
-
-    block_fte_summary    = {}
-    weekend_call_summary = {}
-
-    for s in surgeons:
-        name  = s['name']
-        pref  = get_pref(s)
-        total = sum(
-            result[f"{y}-{str(mo).zfill(2)}"]['fte_summary'].get(name, 0)
-            for y, mo in months
-        )
-        t     = target_shifts[name]
-        cap   = compute_soft_cap(t, pref)
-        delta = total - t
-
-        if t > 0 and total > cap:
-            warnings.append(
-                f"{name}: served {total} shifts (cap {cap}, target {t}) — "
-                f"assigned beyond cap to cover unfilled roles. "
-                f"Review for compensation.")
-        elif t > 0 and delta < -7:
-            warnings.append(
-                f"{name}: served {total} vs target {t} "
-                f"(short {abs(delta)}) — insufficient eligible coverage")
-
-        block_fte_summary[name] = {
-            'served': total,
-            'target': round(block_targets[name], 1),
-            'delta':  round(delta, 1),
-        }
-
-        count = sum(
-            1 for mi, d in weekend_nights
-            if result[
-                f"{months[mi][0]}-{str(months[mi][1]).zfill(2)}"
-            ]['nights'].get(str(d + 1), {}).get('Call') == name
-        )
-        if count > 0:
-            weekend_call_summary[name] = count
-
-    # ── Preference-honoring flags (v22) ───────────────────────────────────────
-    # All computed post-hoc from the finished schedule + preferences, so the
-    # assignment engine above is untouched. Three families:
-    #   preference_override / holiday_override — assigned to a ranked-off week
-    #   contested_week                         — >=2 surgeons want the same week
-    #   call_during_week_off                   — call landed in a ranked-off week
-    surgeon_week_ranks = build_week_ranks(surgeons, preferences)
-
-    # date -> week label (for call-night lookup)
-    def week_label_for_date(dt):
-        for w in all_weeks:
-            if w['start'] <= dt <= w['end']:
-                return w['label']
-        return None
-
-    # 1) Service override flags
-    for mi, (y, mo) in enumerate(months):
-        mk = f"{y}-{str(mo).zfill(2)}"
-        for w in result[mk]['weeks']:
-            lbl = w['label']
-            for role in ROLE_SHIFTS:
-                name = w.get(role)
-                if not name:
-                    continue
-                info = surgeon_week_ranks.get(name, {}).get(lbl)
-                if info:
-                    is_hol = info['is_holiday']
-                    rank   = info['rank']
-                    ftype  = 'holiday_override' if is_hol else 'preference_override'
-                    tag    = 'HOLIDAY OVERRIDE' if is_hol else 'PREF OVERRIDE'
-                    add_flag(
-                        ftype, 'high',
-                        f"{tag}: {name} assigned {role} for {lbl} "
-                        f"(requested off, rank #{rank}) — coverage forced; "
-                        f"exec review.",
-                        surgeon=name, week=lbl, role=role, rank=rank,
-                        is_holiday=is_hol)
-
-    # 2) Contested-week flags
-    week_requesters = {}  # label -> [(name, rank, is_holiday)]
-    for name, ranks in surgeon_week_ranks.items():
-        for lbl, info in ranks.items():
-            week_requesters.setdefault(lbl, []).append(
-                (name, info['rank'], info['is_holiday']))
-    for lbl, reqs in week_requesters.items():
-        if len(reqs) >= 2:
-            is_hol     = any(r[2] for r in reqs)
-            contenders = sorted(reqs, key=lambda r: r[1])
-            names_ranks = ", ".join(f"{n} (#{rk})" for n, rk, _ in contenders)
-            adjudication = None
-            if is_hol and holiday_history:
-                # Strongest claim first = most recent holiday duty. Advisory only.
-                adjudication = [
-                    n for n, _, _ in sorted(
-                        contenders,
-                        key=lambda r: (holiday_history.get(r[0], {}) or {})
-                        .get('recent_holidays_worked', 0),
-                        reverse=True)
-                ]
-            add_flag(
-                'contested_week', 'medium',
-                f"CONTESTED WEEK{' [HOLIDAY]' if is_hol else ''}: {lbl} "
-                f"requested by {len(reqs)} surgeons — {names_ranks}. "
-                f"Filled; chief to review.",
-                week=lbl, is_holiday=is_hol,
-                contenders=[{'surgeon': n, 'rank': rk, 'is_holiday': h}
-                            for n, rk, h in contenders],
-                adjudication=adjudication)
-
-    # 3) Call-during-week-off flags
-    for mi, (y, mo) in enumerate(months):
-        mk = f"{y}-{str(mo).zfill(2)}"
-        for d in range(month_days[mi]):
-            call_name = result[mk]['nights'].get(str(d + 1), {}).get('Call', '')
-            if not call_name:
-                continue
-            dt  = datetime(y, mo, d + 1)
-            lbl = week_label_for_date(dt)
-            if not lbl:
-                continue
-            info = surgeon_week_ranks.get(call_name, {}).get(lbl)
-            if info:
-                add_flag(
-                    'call_during_week_off', 'high',
-                    f"CALL DURING WEEK OFF: {call_name} on call "
-                    f"{dt.strftime('%b %-d')} during requested week off {lbl} "
-                    f"(rank #{info['rank']}) — exec decision required.",
-                    surgeon=call_name, date=dt.strftime('%Y-%m-%d'),
-                    week=lbl, rank=info['rank'], is_holiday=info['is_holiday'])
-
-    return {
-        'months': result,
-        'validation': {
-            'violations':           violations,
-            'warnings':             warnings,
-            'flags':                flags,
-            'valid':                len(violations) == 0,
-            'block_fte_summary':    block_fte_summary,
-            'weekend_call_summary': weekend_call_summary,
-        }
-    }
+    return {'months': result, 'validation': validation}
 
 
 if __name__ == '__main__':
