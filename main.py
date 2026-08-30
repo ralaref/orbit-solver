@@ -1,27 +1,32 @@
 """
-ORbit Surgical Scheduling Solver v23
+ORbit Surgical Scheduling Solver v24
 =====================================
-v23: CHECK-ONLY MODE (no change to the optimizer or to any flag rule).
-All flag/violation/warning logic is extracted into a single shared
-function, validate_schedule(). Two callers now use it:
+v24: BLOCK BOUNDARY. A week belongs to the month containing its Monday.
+A block therefore starts at the first Monday inside its first month — any
+earlier days belong to a week the previous month already owns.
 
-  - build_output() runs it at the end of a full solve (identical output
-    to v22 — same flags, same warnings, same numbers).
-  - a NEW '/validate-only' endpoint runs ONLY that function against a
-    schedule the app sends, with no optimizing. It returns the same
-    'validation' shape in a fraction of a second.
+  - get_block_start() computes that Monday from the calendar. It is not a
+    fixed date: Jan 2027 -> Jan 4, Jul 2027 -> Jul 5, Jan 2028 -> Jan 3.
+  - get_all_weeks() no longer builds the previous month's week into the
+    block's first month. Block 2 stops claiming Dec 28 - Jan 3.
+  - solve_call() no longer assigns call to days before that Monday. Those
+    nights belong to the previous block and are already published.
+  - build_output() omits those days from the nights map, so a merge upstream
+    cannot blank them out with empty values.
+  - Both endpoints derive the same date, so no route change is needed.
 
-This lets the app re-check a hand-edited schedule instantly (e.g. right
-after applying a suggested swap) without re-solving the whole block, and
-keeps the rules in ONE place so the app and solver can never disagree.
+NOTHING in the optimizer changed: scoring, eligibility, caps, fellow quotas
+and every call constraint are identical to v23.
 
-v22: Observability + preference-honoring hardening. Preference-override
-flags, rank-scaled heavy-soft call avoidance, contested-week detection,
-holiday protection + history hook, and a typed 'flags' layer. Preferences
-remain SOFT everywhere — all roles/nights filled; the compromise is flagged.
+Known side effect: /validate-only on Block 1 now treats Jun 29 - Jul 5 as
+outside the block, so fellow period counts there may shift by one. Block 1
+is published and not regenerated; this affects advisory warnings only.
 
+v23: CHECK-ONLY MODE. All flag/violation/warning logic extracted into
+validate_schedule(), used by both build_output() and /validate-only.
+v22: Observability + preference-honoring hardening.
 v21: Ranked time-off week preferences as soft penalties in pace_score.
-v20: Block target = 84 × FTE for every block; over-target is compensation.
+v20: Block target = 84 x FTE for every block; over-target is compensation.
 """
 
 from flask import Flask, request, jsonify
@@ -60,7 +65,7 @@ CALL_OFFWEEK_HOLIDAY_MULT = 1.5
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v23'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v24'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -84,11 +89,14 @@ def solve_block():
         else:
             months = [(start_year + 1, m) for m in BLOCK2_MONTHS]
 
+        block_start = get_block_start(months)
+
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v23 SOLVER STARTED ===", flush=True)
+        print("=== v24 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
+        print(f"DEBUG block_start={block_start.strftime('%Y-%m-%d') if block_start else None}", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
 
@@ -99,6 +107,7 @@ def solve_block():
             preferences=preferences,
             prior_totals=prior_totals,
             holiday_history=holiday_history,
+            block_start=block_start,
         )
 
         call_assignments = solve_call(
@@ -106,6 +115,7 @@ def solve_block():
             months=months,
             week_assignments=week_assignments,
             preferences=preferences,
+            block_start=block_start,
         )
 
         result = build_output(
@@ -117,6 +127,7 @@ def solve_block():
             prior_totals=prior_totals,
             preferences=preferences,
             holiday_history=holiday_history,
+            block_start=block_start,
         )
 
         return jsonify({'success': True, 'schedule': result})
@@ -159,9 +170,12 @@ def validate_only():
         else:
             months = [(start_year + 1, m) for m in BLOCK2_MONTHS]
 
+        block_start = get_block_start(months)
+
         validation = validate_schedule(
             schedule, surgeons, months, block_number, prior_totals,
-            preferences=preferences, holiday_history=holiday_history)
+            preferences=preferences, holiday_history=holiday_history,
+            block_start=block_start)
 
         return jsonify({'success': True, 'validation': validation})
 
@@ -174,13 +188,66 @@ def validate_only():
         }), 500
 
 
-def get_all_weeks(months):
+# ─────────────────────────────────────────────────────────────────
+# BLOCK BOUNDARY (v24)
+# ─────────────────────────────────────────────────────────────────
+
+def get_block_start(months):
+    """
+    The Monday of the first week this block owns.
+
+    A week belongs to the month containing its Monday. So a block begins at the
+    first Monday that falls inside its first month; anything earlier sits in a
+    week the previous month already owns and has already been published.
+
+    Computed from the calendar every time, never hardcoded:
+      Jan 2027 starts Friday  -> Jan 4, 2027
+      Jul 2027 starts Thursday-> Jul 5, 2027
+      Jan 2028 starts Saturday-> Jan 3, 2028
+      a month starting Monday -> the 1st
+    """
+    if not months:
+        return None
+    y, mo     = months[0]
+    first_day = datetime(y, mo, 1)
+    if first_day.weekday() == 0:
+        return first_day
+    return first_day + timedelta(days=7 - first_day.weekday())
+
+
+def block_day_offsets(months, block_start):
+    """
+    0-indexed first day to include, per month.
+
+    Only the block's first month can carry leading days that belong to the
+    previous block's last week. Every other month starts at day 0.
+    """
+    offsets = [0] * len(months)
+    if block_start is not None and months:
+        y, mo = months[0]
+        if block_start.year == y and block_start.month == mo:
+            offsets[0] = block_start.day - 1
+    return offsets
+
+
+# ─────────────────────────────────────────────────────────────────
+# WEEK UTILITIES
+# ─────────────────────────────────────────────────────────────────
+
+def get_all_weeks(months, block_start=None):
     seen  = set()
     weeks = []
     for mi, (y, mo) in enumerate(months):
         first_day  = datetime(y, mo, 1)
         week_start = first_day - timedelta(days=first_day.weekday())
         while True:
+            # v24: a week starting before the block's first Monday belongs to
+            # the previous month, which already owns and has published it.
+            if block_start is not None and week_start < block_start:
+                week_start += timedelta(days=7)
+                if week_start.year > y or (week_start.year == y and week_start.month > mo):
+                    break
+                continue
             has_days = any(
                 (week_start + timedelta(days=o)).year == y and
                 (week_start + timedelta(days=o)).month == mo
@@ -217,6 +284,10 @@ def get_two_month_periods(months):
     # shorter month lists so check-only never index-errors on partial input.
     return [[months[i], months[i + 1]] for i in range(0, len(months) - 1, 2)]
 
+
+# ─────────────────────────────────────────────────────────────────
+# SURGEON HELPERS
+# ─────────────────────────────────────────────────────────────────
 
 def is_eligible(surgeon, role):
     role_map = {
@@ -447,9 +518,9 @@ def compute_fellow_period_targets(fellows, periods, all_weeks):
 
 
 def greedy_service_weeks(surgeons, months, block_number, preferences,
-                         prior_totals, holiday_history=None):
+                         prior_totals, holiday_history=None, block_start=None):
     holiday_history = holiday_history or {}
-    all_weeks = get_all_weeks(months)
+    all_weeks = get_all_weeks(months, block_start)
     periods   = get_two_month_periods(months)
 
     fellows   = [s for s in surgeons if is_fellow(s)]
@@ -457,6 +528,8 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
 
     print(f"DEBUG fellows detected: {[f['name'] for f in fellows]}", flush=True)
     print(f"DEBUG total weeks generated: {len(all_weeks)}", flush=True)
+    if all_weeks:
+        print(f"DEBUG first week: {all_weeks[0]['label']} | last week: {all_weeks[-1]['label']}", flush=True)
 
     surgeon_time_off = {}
     for s in surgeons:
@@ -669,11 +742,18 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
     return week_assignments
 
 
-def solve_call(surgeons, months, week_assignments, preferences):
+def solve_call(surgeons, months, week_assignments, preferences, block_start=None):
     num_surgeons   = len(surgeons)
     num_months     = len(months)
     month_days     = [monthrange(y, mo)[1] for y, mo in months]
     fellow_indices = [i for i, s in enumerate(surgeons) if is_fellow(s)]
+
+    # v24: days before the block's first Monday belong to the previous block's
+    # last week. They are already published; the solver must not touch them.
+    day_start = block_day_offsets(months, block_start)
+    if day_start[0] > 0:
+        print(f"DEBUG call skipping {day_start[0]} leading day(s) of "
+              f"{months[0][0]}-{months[0][1]:02d} — owned by previous block", flush=True)
 
     surgeon_avoid = {}
     for i, s in enumerate(surgeons):
@@ -708,7 +788,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
     night_role = {}
     for mi, (y, mo) in enumerate(months):
         night_role[mi] = {}
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             night_role[mi][d] = {}
             date_dt = datetime(y, mo, d + 1)
             for wi in sorted(week_assignments.keys()):
@@ -727,6 +807,8 @@ def solve_call(surgeons, months, week_assignments, preferences):
     model  = cp_model.CpModel()
     solver = cp_model.CpSolver()
 
+    # Variables are still built for every day so indexing stays simple. Days
+    # outside the block are pinned to zero and never get an ExactlyOne.
     call = [
         [[model.NewBoolVar(f'c_{mi}_{d}_{i}') for i in range(num_surgeons)]
          for d in range(month_days[mi])]
@@ -735,17 +817,21 @@ def solve_call(surgeons, months, week_assignments, preferences):
 
     for mi in range(num_months):
         for d in range(month_days[mi]):
-            model.AddExactlyOne(call[mi][d])
+            if d < day_start[mi]:
+                for i in range(num_surgeons):
+                    model.Add(call[mi][d][i] == 0)
+            else:
+                model.AddExactlyOne(call[mi][d])
 
     for mi, (y, mo) in enumerate(months):
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             for i in range(num_surgeons):
                 if (not active_in_month[mi][i] or
                         not is_eligible(surgeons[i], 'call')):
                     model.Add(call[mi][d][i] == 0)
 
     for mi, (y, mo) in enumerate(months):
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             dow = datetime(y, mo, d + 1).weekday()
             for i in range(num_surgeons):
                 role = night_role[mi][d].get(i)
@@ -764,7 +850,8 @@ def solve_call(surgeons, months, week_assignments, preferences):
         max_call = int(surgeons[i].get('max_call_per_month', 5))
         for mi in range(num_months):
             model.Add(
-                sum(call[mi][d][i] for d in range(month_days[mi])) <= max_call)
+                sum(call[mi][d][i]
+                    for d in range(day_start[mi], month_days[mi])) <= max_call)
 
     for i in range(num_surgeons):
         if i in fellow_indices:
@@ -772,7 +859,8 @@ def solve_call(surgeons, months, week_assignments, preferences):
         max_call = int(surgeons[i].get('max_call_per_month', 8))
         for mi in range(num_months):
             model.Add(
-                sum(call[mi][d][i] for d in range(month_days[mi])) <= max_call)
+                sum(call[mi][d][i]
+                    for d in range(day_start[mi], month_days[mi])) <= max_call)
 
     obj_terms     = []
     penalty_terms = []
@@ -780,7 +868,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
     weekend_nights = [
         (mi, d)
         for mi, (y, mo) in enumerate(months)
-        for d in range(month_days[mi])
+        for d in range(day_start[mi], month_days[mi])
         if datetime(y, mo, d + 1).weekday() >= 4
     ]
     total_weekend = len(weekend_nights)
@@ -813,7 +901,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
             penalty_terms.append(40 * wknd_undr)
 
     for mi, (y, mo) in enumerate(months):
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             dow = datetime(y, mo, d + 1).weekday()
             for i in range(num_surgeons):
                 pref_days = surgeons[i].get('call_day_preference', '') or ''
@@ -826,7 +914,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
     for mi in range(num_months):
         days = month_days[mi]
         for i in range(num_surgeons):
-            for d in range(days - 3):
+            for d in range(day_start[mi], days - 3):
                 run4 = model.NewBoolVar(f'r4_{mi}_{d}_{i}')
                 model.AddMinEquality(run4, [
                     call[mi][d][i],   call[mi][d+1][i],
@@ -835,13 +923,13 @@ def solve_call(surgeons, months, week_assignments, preferences):
                 penalty_terms.append(25 * run4)
 
     for mi, (y, mo) in enumerate(months):
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             for i in range(num_surgeons):
                 if surgeon_avoid[i] and day_in_dates(y, mo, d, surgeon_avoid[i]):
                     penalty_terms.append(30 * call[mi][d][i])
 
     for mi, (y, mo) in enumerate(months):
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             cur = datetime(y, mo, d + 1).date()
             for i in range(num_surgeons):
                 info = surgeon_offweek.get(i, {}).get(cur)
@@ -879,7 +967,7 @@ def solve_call(surgeons, months, week_assignments, preferences):
 
     call_assignments = {}
     for mi in range(num_months):
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             for i in range(num_surgeons):
                 if solver.Value(call[mi][d][i]):
                     call_assignments[(mi, d)] = surgeons[i]['name']
@@ -888,12 +976,17 @@ def solve_call(surgeons, months, week_assignments, preferences):
 
 
 def validate_schedule(result, surgeons, months, block_number, prior_totals,
-                      preferences=None, holiday_history=None):
+                      preferences=None, holiday_history=None, block_start=None):
     """
     THE single source of truth for flags/violations/warnings.
     Operates purely on an assembled schedule (`result`: {month_key: {weeks,
     nights}}), so it works identically for a fresh solve and for a hand-edited
     schedule sent by the app. No optimizing here — only checking.
+
+    Day-level checks are deliberately NOT gated on block_start: whatever the
+    app sends gets checked. If the previous block's published nights are still
+    present in the first month's row, they validate normally; if they have gone
+    missing, that is worth flagging.
     """
     preferences     = preferences or []
     holiday_history = holiday_history or {}
@@ -907,7 +1000,7 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
     }
     target_shifts = {name: max(0, round(t)) for name, t in block_targets.items()}
 
-    all_weeks = get_all_weeks(months)
+    all_weeks = get_all_weeks(months, block_start)
 
     # Ordered weeks (chronological) with their assignments pulled from `result`
     # by label. Replaces the internal week_assignments dict for adjacency checks.
@@ -1202,13 +1295,17 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
 
 def build_output(surgeons, months, week_assignments, call_assignments,
                  block_number, prior_totals, preferences=None,
-                 holiday_history=None):
+                 holiday_history=None, block_start=None):
 
     preferences     = preferences or []
     holiday_history = holiday_history or {}
 
     num_months = len(months)
     month_days = [monthrange(y, mo)[1] for y, mo in months]
+
+    # v24: leading days owned by the previous block are omitted entirely, so a
+    # merge upstream cannot overwrite published nights with empty values.
+    day_start = block_day_offsets(months, block_start)
 
     months_weeks = {mi: [] for mi in range(num_months)}
     for wi in sorted(week_assignments.keys()):
@@ -1227,7 +1324,7 @@ def build_output(surgeons, months, week_assignments, call_assignments,
             result_weeks.append(week_data)
 
         result_nights = {}
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             name = call_assignments.get((mi, d), '')
             result_nights[str(d + 1)] = {'Call': name, 'Backup': ''}
 
@@ -1250,7 +1347,8 @@ def build_output(surgeons, months, week_assignments, call_assignments,
     # Single source of truth — same function the /validate-only endpoint uses.
     validation = validate_schedule(
         result, surgeons, months, block_number, prior_totals,
-        preferences=preferences, holiday_history=holiday_history)
+        preferences=preferences, holiday_history=holiday_history,
+        block_start=block_start)
 
     return {'months': result, 'validation': validation}
 
