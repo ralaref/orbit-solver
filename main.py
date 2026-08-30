@@ -1,6 +1,14 @@
 """
-ORbit Surgical Scheduling Solver v24
+ORbit Surgical Scheduling Solver v25
 =====================================
+v25: The boundary rule now applies to CHECKING as well as building.
+
+v24 stopped the solver producing call before the block's first Monday, but
+validate_schedule() still looked for it, so a clean Block 2 solve reported
+"January day 1: No call surgeon assigned" for the three days December owns.
+Solver right, checker wrong. The missing-call check now starts at the same
+computed Monday, via the block_day_offsets() helper v24 already added.
+
 v24: BLOCK BOUNDARY. A week belongs to the month containing its Monday.
 A block therefore starts at the first Monday inside its first month — any
 earlier days belong to a week the previous month already owns.
@@ -65,7 +73,7 @@ CALL_OFFWEEK_HOLIDAY_MULT = 1.5
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v24'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v25'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -94,7 +102,7 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v24 SOLVER STARTED ===", flush=True)
+        print("=== v25 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         print(f"DEBUG block_start={block_start.strftime('%Y-%m-%d') if block_start else None}", flush=True)
         for s in surgeons:
@@ -983,16 +991,18 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
     nights}}), so it works identically for a fresh solve and for a hand-edited
     schedule sent by the app. No optimizing here — only checking.
 
-    Day-level checks are deliberately NOT gated on block_start: whatever the
-    app sends gets checked. If the previous block's published nights are still
-    present in the first month's row, they validate normally; if they have gone
-    missing, that is worth flagging.
+    The missing-call check starts at the block's first Monday. Days before it
+    sit inside a week the previous month owns and has already published, and
+    this block never produces them — so looking for them here only ever
+    generates false violations. Every other check reads whatever is present
+    and needs no gating.
     """
     preferences     = preferences or []
     holiday_history = holiday_history or {}
 
     num_months = len(months)
     month_days = [monthrange(y, mo)[1] for y, mo in months]
+    day_start  = block_day_offsets(months, block_start)
 
     block_targets = {
         s['name']: compute_block_target(s, block_number, prior_totals, months)
@@ -1052,7 +1062,7 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
                         f"{month_label} {w.get('label','?')}: {role} unfilled — "
                         f"no eligible surgeon found")
 
-        for d in range(month_days[mi]):
+        for d in range(day_start[mi], month_days[mi]):
             if not nights.get(str(d + 1), {}).get('Call'):
                 violations.append(
                     f"{month_label} day {d + 1}: No call surgeon assigned")
