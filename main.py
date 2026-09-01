@@ -1,51 +1,49 @@
 """
-ORbit Surgical Scheduling Solver v26
+ORbit Surgical Scheduling Solver v27
 =====================================
-v26: ELECTIVE PRACTICE. A surgeon can hold two protected weeks a month — an
-elective week (off service, a fixed number of call nights inside it) and an
-admin week (off service, no call at all). The shape is a standing preference on
-the surgeon record, sent through as an `elective` object.
+v27: PACE SCARCITY for elective surgeons.
 
-Everything here is SOFT. Coverage still wins over preference, exactly as it does
-for ranked time off, because a hard rule cannot be outvoted by the need to fill a
-slot — and an unfilled slot is worse than a broken preference.
+v26 gave a surgeon two protected weeks a month and honoured them, but left them
+short of target — 75 against 84 on the first Block 2 run, with four available
+weeks sitting unworked. The weeks were there; the greedy never routed them.
 
-  - The route already sends elective and admin weeks as rank-1 time off, which
-    keeps the surgeon off service and off call for the whole week. That is the
-    right default, but it also suppresses the call nights they ASKED for. So
-    solve_call now cancels the off-week penalty on the chosen days and rewards
-    call there instead. Net effect: the elective week holds exactly the nights
-    that were picked and nothing else.
-  - The fourth night lands on the Sunday before the admin week, which is always
-    free of service because the admin week has none.
-  - No call the Sunday immediately before the elective week.
-  - greedy_service_weeks lets an opted-in surgeon take two consecutive 7-day
-    weeks — capped at two, never three. Everyone else keeps the old rule of
-    never two in a row.
-  - `seven_day_weeks_only` is a scoring preference, not a rule: a 5-day ACS week
-    costs a whole week for five shifts, which is what makes 84 unreachable when
-    two weeks a month are already spoken for.
+The cause is in pace_score. Deficit is measured as a FRACTION OF TARGET:
 
-A surgeon with no `elective` object is scored and constrained exactly as in v25.
+    pace_deficit = (budget - served) / target
+
+so the same absolute shortfall reads differently depending on the size of the
+target. Seven shifts behind is 0.083 on a target of 84 and 0.167 on a target of
+42. A 1.0 FTE surgeon therefore loses ties to half-timers who look twice as far
+behind while being the same distance behind in real terms.
+
+That is a general property of the scoring and changing it moves everybody, so
+v27 does not touch it. What it does is correct for the thing that makes it bite
+an elective surgeon specifically: they have fourteen chances to reach the same
+number, not twenty-six. Each available week carries nearly twice the weight, and
+a week they are passed over for cannot be made up later in the way it can for
+someone with the whole block available.
+
+    scarcity = active weeks / available weeks   (capped at 2.0)
+
+applied to the deficit only when they are BEHIND. Ahead of pace they yield
+normally — an elective practice is a reason to be routed efficiently into the
+weeks you have, not a reason to be routed past your target.
+
+Surgeons with no elective practice have a scarcity of exactly 1.0 and are scored
+byte for byte as in v26.
+
+v26: ELECTIVE PRACTICE. Two protected weeks a month — an elective week (off
+service, a fixed number of call nights inside it) and an admin week (off
+service, no call at all). Everything soft; coverage still wins over preference.
+Consecutive 7-day weeks became a per-surgeon ceiling rather than a flat bar.
 
 The weekend-spacing defect is NOT addressed here and remains open: solve_call
 balances weekend COUNTS with no concept of spacing, so twelve weekends spread
 evenly and twelve stacked six-deep still score identically.
 
 v25: The boundary rule now applies to CHECKING as well as building.
-
-v24 stopped the solver producing call before the block's first Monday, but
-validate_schedule() still looked for it, so a clean Block 2 solve reported
-"January day 1: No call surgeon assigned" for the three days December owns.
-Solver right, checker wrong. The missing-call check now starts at the same
-computed Monday, via the block_day_offsets() helper v24 added.
-
 v24: BLOCK BOUNDARY. A week belongs to the month containing its Monday.
-A block therefore starts at the first Monday inside its first month — any
-earlier days belong to a week the previous month already owns.
-
-v23: CHECK-ONLY MODE. All flag/violation/warning logic extracted into
-validate_schedule(), used by both build_output() and /validate-only.
+v23: CHECK-ONLY MODE. All flag/violation/warning logic in validate_schedule().
 v22: Observability + preference-honoring hardening.
 v21: Ranked time-off week preferences as soft penalties in pace_score.
 v20: Block target = 84 x FTE for every block; over-target is compensation.
@@ -95,13 +93,20 @@ CALL_OFFWEEK_HOLIDAY_MULT = 1.5
 ELECTIVE_CALL_REWARD    = 150
 ELECTIVE_AVOID_PENALTY  = 200
 
+# ── Pace scarcity (v27) ──────────────────────────────────────────────────────
+# The ceiling on how much an elective surgeon's deficit may be amplified. Two
+# protected weeks a month gives 26/14 = 1.86, so the cap does not bind today —
+# it exists so that a future arrangement with very few available weeks cannot
+# make one person outscore the entire division on every remaining week.
+PACE_SCARCITY_CAP = 2.0
+
 # Python's weekday(): Monday is 0.
 DOW_KEYS = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v26'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v27'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -130,7 +135,7 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v26 SOLVER STARTED ===", flush=True)
+        print("=== v27 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         print(f"DEBUG block_start={block_start.strftime('%Y-%m-%d') if block_start else None}", flush=True)
         for s in surgeons:
@@ -443,6 +448,14 @@ def elective_prefers_seven_day(surgeon):
     return bool(get_elective(surgeon).get('seven_day_weeks_only'))
 
 
+def elective_protected_labels(surgeon):
+    """Every week label this surgeon holds off service by arrangement."""
+    el = get_elective(surgeon)
+    if not el:
+        return set()
+    return set(el.get('elective_weeks') or []) | set(el.get('admin_weeks') or [])
+
+
 def date_to_slot(dt, months, day_start):
     """A date -> (month index, 0-indexed day), or None if outside the block."""
     for mi, (y, mo) in enumerate(months):
@@ -733,6 +746,27 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         for s in surgeons
     }
 
+    # ── v27: pace scarcity ────────────────────────────────────────────────
+    # An elective surgeon carries the same target across far fewer weeks, and
+    # a week they lose cannot be made up the way it can for someone with the
+    # whole block open. Their deficit is scaled by how scarce their available
+    # weeks are, so a tie against someone with twice the runway goes to them.
+    #
+    # Every other surgeon gets exactly 1.0 and is scored as in v26.
+    week_label_set = {w['label'] for w in all_weeks}
+    pace_scarcity  = {}
+    for s in surgeons:
+        name      = s['name']
+        protected = elective_protected_labels(s) & week_label_set
+        active    = surgeon_active_weeks[name]
+        available = active - len(protected)
+        if not protected or available <= 0 or active <= 0:
+            pace_scarcity[name] = 1.0
+            continue
+        pace_scarcity[name] = min(active / available, PACE_SCARCITY_CAP)
+        print(f"DEBUG {name}: {available} of {active} weeks available, "
+              f"pace scarcity {pace_scarcity[name]:.2f}", flush=True)
+
     served           = {n: 0   for n in all_names}
     last_service_wi  = {n: -99 for n in all_names}
     last_7day_wi     = {n: -99 for n in all_names}
@@ -811,6 +845,14 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         so_far       = active_so_far[name]
         budget       = t * (so_far / total_active) if total_active > 0 else 0
         pace_deficit = (budget - served[name]) / t
+
+        # v27: behind pace, an elective surgeon has fewer weeks left to make it
+        # up in, so the same shortfall matters more. Ahead of pace they yield
+        # normally — scaling a surplus would push them past target, which is
+        # the opposite of what the arrangement is for.
+        if pace_deficit > 0:
+            pace_deficit *= pace_scarcity[name]
+
         rest         = min((wi - last_service_wi[name]) * 0.08, 0.4)
         pref_adj     = 0.0
 
