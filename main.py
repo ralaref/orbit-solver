@@ -1,34 +1,48 @@
 """
-ORbit Surgical Scheduling Solver v25
+ORbit Surgical Scheduling Solver v26
 =====================================
+v26: ELECTIVE PRACTICE. A surgeon can hold two protected weeks a month — an
+elective week (off service, a fixed number of call nights inside it) and an
+admin week (off service, no call at all). The shape is a standing preference on
+the surgeon record, sent through as an `elective` object.
+
+Everything here is SOFT. Coverage still wins over preference, exactly as it does
+for ranked time off, because a hard rule cannot be outvoted by the need to fill a
+slot — and an unfilled slot is worse than a broken preference.
+
+  - The route already sends elective and admin weeks as rank-1 time off, which
+    keeps the surgeon off service and off call for the whole week. That is the
+    right default, but it also suppresses the call nights they ASKED for. So
+    solve_call now cancels the off-week penalty on the chosen days and rewards
+    call there instead. Net effect: the elective week holds exactly the nights
+    that were picked and nothing else.
+  - The fourth night lands on the Sunday before the admin week, which is always
+    free of service because the admin week has none.
+  - No call the Sunday immediately before the elective week.
+  - greedy_service_weeks lets an opted-in surgeon take two consecutive 7-day
+    weeks — capped at two, never three. Everyone else keeps the old rule of
+    never two in a row.
+  - `seven_day_weeks_only` is a scoring preference, not a rule: a 5-day ACS week
+    costs a whole week for five shifts, which is what makes 84 unreachable when
+    two weeks a month are already spoken for.
+
+A surgeon with no `elective` object is scored and constrained exactly as in v25.
+
+The weekend-spacing defect is NOT addressed here and remains open: solve_call
+balances weekend COUNTS with no concept of spacing, so twelve weekends spread
+evenly and twelve stacked six-deep still score identically.
+
 v25: The boundary rule now applies to CHECKING as well as building.
 
 v24 stopped the solver producing call before the block's first Monday, but
 validate_schedule() still looked for it, so a clean Block 2 solve reported
 "January day 1: No call surgeon assigned" for the three days December owns.
 Solver right, checker wrong. The missing-call check now starts at the same
-computed Monday, via the block_day_offsets() helper v24 already added.
+computed Monday, via the block_day_offsets() helper v24 added.
 
 v24: BLOCK BOUNDARY. A week belongs to the month containing its Monday.
 A block therefore starts at the first Monday inside its first month — any
 earlier days belong to a week the previous month already owns.
-
-  - get_block_start() computes that Monday from the calendar. It is not a
-    fixed date: Jan 2027 -> Jan 4, Jul 2027 -> Jul 5, Jan 2028 -> Jan 3.
-  - get_all_weeks() no longer builds the previous month's week into the
-    block's first month. Block 2 stops claiming Dec 28 - Jan 3.
-  - solve_call() no longer assigns call to days before that Monday. Those
-    nights belong to the previous block and are already published.
-  - build_output() omits those days from the nights map, so a merge upstream
-    cannot blank them out with empty values.
-  - Both endpoints derive the same date, so no route change is needed.
-
-NOTHING in the optimizer changed: scoring, eligibility, caps, fellow quotas
-and every call constraint are identical to v23.
-
-Known side effect: /validate-only on Block 1 now treats Jun 29 - Jul 5 as
-outside the block, so fellow period counts there may shift by one. Block 1
-is published and not regenerated; this affects advisory warnings only.
 
 v23: CHECK-ONLY MODE. All flag/violation/warning logic extracted into
 validate_schedule(), used by both build_output() and /validate-only.
@@ -70,10 +84,24 @@ ROLE_ORDER = ['SICU', 'TSICU', 'McNair ICU', 'ACS (M-Sun)', 'ACS (M-F)']
 CALL_OFFWEEK_PENALTY = {'top': 500, 'mid': 250, 'low': 80}
 CALL_OFFWEEK_HOLIDAY_MULT = 1.5
 
+# ── Elective practice (v26) ──────────────────────────────────────────────────
+# Sized against the terms already in the objective: weekend fairness is 40/20,
+# a four-night run is 25, a call-day preference is 3. A reward of 150 reliably
+# pulls the night to the person who asked for it without swamping the rest.
+#
+# The avoid penalty is deliberately below the rank-1 off-week penalty of 500:
+# not wanting call the night before an elective week is a preference, and it
+# should lose to a night nobody else can cover.
+ELECTIVE_CALL_REWARD    = 150
+ELECTIVE_AVOID_PENALTY  = 200
+
+# Python's weekday(): Monday is 0.
+DOW_KEYS = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
+
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'ORbit Solver v25'})
+    return jsonify({'status': 'ok', 'service': 'ORbit Solver v26'})
 
 
 @app.route('/solve-block', methods=['POST'])
@@ -102,11 +130,22 @@ def solve_block():
         for i, s in enumerate(surgeons):
             s['_idx'] = i
 
-        print("=== v25 SOLVER STARTED ===", flush=True)
+        print("=== v26 SOLVER STARTED ===", flush=True)
         print(f"DEBUG block_number={block_number} start_year={start_year} months={months}", flush=True)
         print(f"DEBUG block_start={block_start.strftime('%Y-%m-%d') if block_start else None}", flush=True)
         for s in surgeons:
             print(f"  {s['name']} | is_fellow={s.get('is_fellow')} | fte={s.get('fte')} | sicu={s.get('covers_sicu')} | acs={s.get('can_acs')}", flush=True)
+
+        for s in surgeons:
+            el = s.get('elective') or {}
+            if el:
+                print(f"DEBUG elective {s['name']}: "
+                      f"elective_weeks={el.get('elective_weeks')} "
+                      f"admin_weeks={el.get('admin_weeks')} "
+                      f"call_days={el.get('call_days')} "
+                      f"sun_before_admin={el.get('call_sunday_before_admin')} "
+                      f"seven_day_only={el.get('seven_day_weeks_only')} "
+                      f"max_consec={el.get('max_consecutive_service_weeks')}", flush=True)
 
         week_assignments = greedy_service_weeks(
             surgeons=surgeons,
@@ -373,6 +412,122 @@ def is_seven_day_role(role):
     return role in ('ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU')
 
 
+# ─────────────────────────────────────────────────────────────────
+# ELECTIVE PRACTICE (v26)
+# ─────────────────────────────────────────────────────────────────
+
+def get_elective(surgeon):
+    """The elective block off a surgeon payload, or an empty dict."""
+    el = surgeon.get('elective')
+    return el if isinstance(el, dict) else {}
+
+
+def elective_max_consecutive(surgeon):
+    """
+    How many 7-day service weeks this surgeon may work back to back.
+
+    One for everybody by default, which is the rule as it has always stood. A
+    surgeon who has opted in can take two — never three, because the ceiling is
+    explicit rather than the constraint simply being removed. Left as a number
+    so a third is a data change and a deliberate one.
+    """
+    el = get_elective(surgeon)
+    try:
+        n = int(el.get('max_consecutive_service_weeks', 1))
+    except Exception:
+        n = 1
+    return 2 if n >= 2 else 1
+
+
+def elective_prefers_seven_day(surgeon):
+    return bool(get_elective(surgeon).get('seven_day_weeks_only'))
+
+
+def date_to_slot(dt, months, day_start):
+    """A date -> (month index, 0-indexed day), or None if outside the block."""
+    for mi, (y, mo) in enumerate(months):
+        if dt.year == y and dt.month == mo:
+            d = dt.day - 1
+            return (mi, d) if d >= day_start[mi] else None
+    return None
+
+
+def build_elective_plan(surgeons, months, week_assignments, day_start):
+    """
+    surgeon index -> {'call': set of (mi, d), 'avoid': set of (mi, d)}
+
+    'call' is every night the surgeon asked for: the chosen days inside each
+    elective week, plus the Sunday before each admin week when that is switched
+    on. 'avoid' is the Sunday immediately before each elective week — walking
+    into the week post-call is the thing the week exists to prevent.
+
+    Weeks are matched by label against the weeks the greedy actually built, so
+    a label that matches nothing contributes nothing rather than silently
+    shifting dates. Admin weeks themselves are absent from both sets: the
+    rank-1 time-off entry the route sends already keeps call out of them, which
+    is exactly the wanted behaviour.
+    """
+    label_start = {}
+    for wa in week_assignments.values():
+        if wa.get('label'):
+            label_start[wa['label']] = wa['start']
+
+    plan = {}
+    for i, s in enumerate(surgeons):
+        el = get_elective(s)
+        if not el:
+            continue
+
+        elective_weeks = el.get('elective_weeks') or []
+        admin_weeks    = el.get('admin_weeks') or []
+        day_offsets    = [DOW_KEYS[d] for d in (el.get('call_days') or [])
+                          if d in DOW_KEYS]
+        want_sunday    = bool(el.get('call_sunday_before_admin'))
+
+        call_slots = set()
+        avoid_slots = set()
+        unmatched = []
+
+        for lbl in elective_weeks:
+            start = label_start.get(lbl)
+            if start is None:
+                unmatched.append(lbl)
+                continue
+            for off in day_offsets:
+                slot = date_to_slot(start + timedelta(days=off), months, day_start)
+                if slot:
+                    call_slots.add(slot)
+            slot = date_to_slot(start - timedelta(days=1), months, day_start)
+            if slot:
+                avoid_slots.add(slot)
+
+        for lbl in admin_weeks:
+            start = label_start.get(lbl)
+            if start is None:
+                unmatched.append(lbl)
+                continue
+            if want_sunday:
+                slot = date_to_slot(start - timedelta(days=1), months, day_start)
+                if slot:
+                    call_slots.add(slot)
+
+        if unmatched:
+            print(f"DEBUG elective {s['name']}: labels matched no week: {unmatched}",
+                  flush=True)
+
+        # A night cannot be both asked for and avoided. The ask wins — it is the
+        # more specific instruction. This only fires if an elective week is
+        # scheduled directly after an admin week and the Sunday is shared.
+        avoid_slots -= call_slots
+
+        if call_slots or avoid_slots:
+            plan[i] = {'call': call_slots, 'avoid': avoid_slots}
+            print(f"DEBUG elective {s['name']}: {len(call_slots)} call night(s) "
+                  f"requested, {len(avoid_slots)} avoided", flush=True)
+
+    return plan
+
+
 def compute_block_target(surgeon, block_number, prior_totals, months):
     fte          = float(surgeon.get('fte', 1.0))
     block_target = BLOCK_FTE_SHIFTS * fte
@@ -487,6 +642,7 @@ def build_week_ranks(surgeons, preferences):
                     d[lbl] = {
                         'rank':       int(w.get('rank', 99)),
                         'is_holiday': bool(w.get('isHoliday', False)),
+                        'source':     w.get('source', ''),
                     }
         out[s['name']] = d
     return out
@@ -552,6 +708,14 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         if d:
             print(f"DEBUG {name} time_off_weeks: {list(d.keys())}", flush=True)
 
+    # v26: per-surgeon ceiling on consecutive 7-day weeks, and whether a 5-day
+    # ACS week should be discouraged. Both default to the v25 behaviour.
+    max_consec_7day = {s['name']: elective_max_consecutive(s) for s in surgeons}
+    prefers_7day    = {s['name']: elective_prefers_seven_day(s) for s in surgeons}
+    for name, n in max_consec_7day.items():
+        if n > 1:
+            print(f"DEBUG {name}: may work up to {n} consecutive 7-day weeks", flush=True)
+
     targets   = {}
     soft_caps = {}
     for s in surgeons:
@@ -574,6 +738,9 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
     last_7day_wi     = {n: -99 for n in all_names}
     last_acs_msun_wi = {n: -99 for n in all_names}
     active_so_far    = {n: 0   for n in all_names}
+    # How many 7-day weeks the surgeon has worked back to back, counting the
+    # run that ends at last_7day_wi. Reset whenever there is a gap.
+    run_7day         = {n: 0   for n in all_names}
 
     fellow_period_targets = compute_fellow_period_targets(fellows, periods, all_weeks)
     fellow_acs_served  = {f['name']: {pi: 0 for pi in range(len(periods))} for f in fellows}
@@ -617,8 +784,13 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         if surgeon_time_off.get(name) and week_overlaps_dates(
                 week, surgeon_time_off[name]):
             return False
-        if is_seven_day_role(role) and wi - last_7day_wi[name] <= 1:
-            return False
+        # v26: was a flat bar on two 7-day weeks in a row. Now a ceiling, which
+        # is the same bar for everyone whose ceiling is one — the default.
+        if is_seven_day_role(role):
+            gap = wi - last_7day_wi[name]
+            if gap <= 1:
+                if not (gap == 1 and run_7day[name] < max_consec_7day[name]):
+                    return False
         if role == 'ACS (M-Sun)' and wi - last_acs_msun_wi[name] <= 1:
             return False
         if is_fellow(surgeon) and not fellow_can_take_role(surgeon, role, week):
@@ -629,7 +801,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
         name = surgeon['name']
         return served[name] < soft_caps[name]
 
-    def pace_score(surgeon, wi):
+    def pace_score(surgeon, wi, role):
         name  = surgeon['name']
         t     = targets[name]
         pref  = get_pref(surgeon)
@@ -659,6 +831,13 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
             if week_info['is_holiday']:
                 mult = 1.5 * holiday_claim_factor(name, holiday_history)
             pref_adj -= base * mult
+
+        # v26: a surgeon with two weeks a month already off service cannot
+        # reach target on 5-day weeks — an ACS M-F week costs a whole week for
+        # five shifts. Discouraged, not barred: if it is the only way to fill
+        # the role, coverage still wins.
+        if role == 'ACS (M-F)' and prefers_7day.get(name):
+            pref_adj -= 0.5
 
         return pace_deficit + rest + pref_adj
 
@@ -702,7 +881,7 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
             if role in assigned_this_week:
                 continue
             candidates = [
-                (pace_score(s, wi), s['name'], s)
+                (pace_score(s, wi, role), s['name'], s)
                 for s in surgeons
                 if base_eligible(s, role, week, wi, assigned_this_week)
                 and within_cap(s)
@@ -734,6 +913,12 @@ def greedy_service_weeks(surgeons, months, block_number, preferences,
             served[name]          += ROLE_SHIFTS[role]
             last_service_wi[name]  = wi
             if is_seven_day_role(role):
+                # Run length is read from the previous 7-day week, so it has to
+                # be updated before last_7day_wi moves.
+                if wi - last_7day_wi[name] == 1:
+                    run_7day[name] += 1
+                else:
+                    run_7day[name] = 1
                 last_7day_wi[name] = wi
             if role == 'ACS (M-Sun)':
                 last_acs_msun_wi[name] = wi
@@ -787,6 +972,11 @@ def solve_call(surgeons, months, week_assignments, preferences, block_start=None
                     hol  = bool(w.get('isHoliday', False))
                     for dt in label_to_dates[lbl]:
                         surgeon_offweek[i][dt] = (rank, hol)
+
+    # v26: the nights an elective surgeon actually asked for. The route sends
+    # their elective week as rank-1 time off, which would otherwise suppress
+    # every night in it — including the three they want.
+    elective_plan = build_elective_plan(surgeons, months, week_assignments, day_start)
 
     active_in_month = [
         [is_active_for_month(surgeons[i], y, mo) for i in range(num_surgeons)]
@@ -940,6 +1130,11 @@ def solve_call(surgeons, months, week_assignments, preferences, block_start=None
         for d in range(day_start[mi], month_days[mi]):
             cur = datetime(y, mo, d + 1).date()
             for i in range(num_surgeons):
+                # v26: a night the surgeon explicitly asked for inside their own
+                # elective week is not a night off. Skipping the penalty here is
+                # what stops the two instructions cancelling out.
+                if (mi, d) in elective_plan.get(i, {}).get('call', ()):
+                    continue
                 info = surgeon_offweek.get(i, {}).get(cur)
                 if not info:
                     continue
@@ -953,6 +1148,15 @@ def solve_call(surgeons, months, week_assignments, preferences, block_start=None
                 if hol:
                     base = int(base * CALL_OFFWEEK_HOLIDAY_MULT)
                 penalty_terms.append(base * call[mi][d][i])
+
+    # v26: the elective shape itself. A reward on each requested night rather
+    # than a hard "exactly three", so a night nobody else can cover still gets
+    # covered and the week simply comes back one short — visible, not broken.
+    for i, plan in elective_plan.items():
+        for (mi, d) in plan['call']:
+            obj_terms.append(ELECTIVE_CALL_REWARD * call[mi][d][i])
+        for (mi, d) in plan['avoid']:
+            penalty_terms.append(ELECTIVE_AVOID_PENALTY * call[mi][d][i])
 
     total_obj = []
     if obj_terms:
@@ -979,6 +1183,15 @@ def solve_call(surgeons, months, week_assignments, preferences, block_start=None
             for i in range(num_surgeons):
                 if solver.Value(call[mi][d][i]):
                     call_assignments[(mi, d)] = surgeons[i]['name']
+
+    # How many of the requested elective nights were actually granted. Printed
+    # rather than inferred later from a schedule nobody wants to count by hand.
+    for i, plan in elective_plan.items():
+        got = sum(1 for slot in plan['call']
+                  if call_assignments.get(slot) == surgeons[i]['name'])
+        print(f"DEBUG elective {surgeons[i]['name']}: "
+              f"{got} of {len(plan['call'])} requested call nights granted",
+              flush=True)
 
     return call_assignments
 
@@ -1079,6 +1292,10 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
                     seen[name] = role
 
     # ── Consecutive 7-day service weeks (warning) ──
+    # v26: silent for a surgeon who has opted into two in a row. It is the
+    # arrangement working, not a compromise, and flagging it would train
+    # everyone to scroll past a list that is mostly noise.
+    allows_pair = {s['name']: elective_max_consecutive(s) >= 2 for s in surgeons}
     seven_day_roles = ['ACS (M-Sun)', 'McNair ICU', 'TSICU', 'SICU']
     for i in range(len(all_weeks_flat) - 1):
         w1 = all_weeks_flat[i]
@@ -1087,10 +1304,23 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
             for r2 in seven_day_roles:
                 n1 = w1.get(r1)
                 n2 = w2.get(r2)
-                if n1 and n2 and n1 == n2:
+                if n1 and n2 and n1 == n2 and not allows_pair.get(n1):
                     warnings.append(
                         f"Consecutive 7-day weeks: {n1} "
                         f"({r1} -> {r2}) — review manually")
+
+    # Three in a row is beyond any ceiling and is always worth saying.
+    for i in range(len(all_weeks_flat) - 2):
+        trio = [all_weeks_flat[i], all_weeks_flat[i + 1], all_weeks_flat[i + 2]]
+        holders = []
+        for w in trio:
+            names = [w.get(r) for r in seven_day_roles if w.get(r)]
+            holders.append(set(names))
+        common = holders[0] & holders[1] & holders[2]
+        for n in sorted(common):
+            warnings.append(
+                f"Three consecutive 7-day weeks: {n} — beyond any ceiling, "
+                f"review manually")
 
     # ── ACS M-Sun consecutive (hard violation) ──
     for i in range(len(all_weeks_flat) - 1):
@@ -1191,9 +1421,19 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
                 f"assigned beyond cap to cover unfilled roles. "
                 f"Review for compensation.")
         elif t > 0 and delta < -7:
-            warnings.append(
-                f"{name}: served {total} vs target {t} "
-                f"(short {abs(delta)}) — insufficient eligible coverage")
+            # v26: a surgeon with an elective practice has two weeks a month off
+            # service by arrangement, so falling short is the expected shape
+            # rather than thin coverage. Said differently so nobody reads it as
+            # a fault in the schedule.
+            if get_elective(s):
+                warnings.append(
+                    f"{name}: served {total} vs target {t} "
+                    f"(short {abs(delta)}) — elective practice reduces available "
+                    f"weeks; review whether the shape reaches target.")
+            else:
+                warnings.append(
+                    f"{name}: served {total} vs target {t} "
+                    f"(short {abs(delta)}) — insufficient eligible coverage")
 
         block_fte_summary[name] = {
             'served': total,
@@ -1231,20 +1471,38 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
                 if info:
                     is_hol = info['is_holiday']
                     rank   = info['rank']
-                    ftype  = 'holiday_override' if is_hol else 'preference_override'
-                    tag    = 'HOLIDAY OVERRIDE' if is_hol else 'PREF OVERRIDE'
-                    add_flag(
-                        ftype, 'high',
-                        f"{tag}: {name} assigned {role} for {lbl} "
-                        f"(requested off, rank #{rank}) — coverage forced; "
-                        f"exec review.",
-                        surgeon=name, week=lbl, role=role, rank=rank,
-                        is_holiday=is_hol)
+                    src    = info.get('source', '')
+                    if src in ('elective', 'admin'):
+                        # An elective or admin week filled anyway is a real
+                        # compromise, but it is not the surgeon's ranked
+                        # holiday request and should not read as one.
+                        add_flag(
+                            'elective_override', 'high',
+                            f"ELECTIVE OVERRIDE: {name} assigned {role} for {lbl} "
+                            f"({'elective' if src == 'elective' else 'admin'} week) "
+                            f"— coverage forced; exec review.",
+                            surgeon=name, week=lbl, role=role, rank=rank,
+                            is_holiday=False, elective_kind=src)
+                    else:
+                        ftype = 'holiday_override' if is_hol else 'preference_override'
+                        tag   = 'HOLIDAY OVERRIDE' if is_hol else 'PREF OVERRIDE'
+                        add_flag(
+                            ftype, 'high',
+                            f"{tag}: {name} assigned {role} for {lbl} "
+                            f"(requested off, rank #{rank}) — coverage forced; "
+                            f"exec review.",
+                            surgeon=name, week=lbl, role=role, rank=rank,
+                            is_holiday=is_hol)
 
     # 2) Contested weeks
+    # An elective or admin week is a standing arrangement, not a bid for a week,
+    # so it does not make a week contested — otherwise every elective surgeon
+    # would appear to be fighting the whole division six times a block.
     week_requesters = {}
     for name, ranks in surgeon_week_ranks.items():
         for lbl, info in ranks.items():
+            if info.get('source') in ('elective', 'admin'):
+                continue
             week_requesters.setdefault(lbl, []).append(
                 (name, info['rank'], info['is_holiday']))
     for lbl, reqs in week_requesters.items():
@@ -1272,6 +1530,9 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
                 adjudication=adjudication)
 
     # 3) Call during a requested week off
+    # Call inside an elective week is the arrangement, not a breach — the whole
+    # point is a small number of nights inside a week off service. Call inside
+    # an ADMIN week is still wrong and still flagged.
     for mi, (y, mo) in enumerate(months):
         mk     = f"{y}-{str(mo).zfill(2)}"
         nights = (result.get(mk, {}) or {}).get('nights', {}) or {}
@@ -1284,14 +1545,27 @@ def validate_schedule(result, surgeons, months, block_number, prior_totals,
             if not lbl:
                 continue
             info = surgeon_week_ranks.get(call_name, {}).get(lbl)
-            if info:
+            if not info:
+                continue
+            src = info.get('source', '')
+            if src == 'elective':
+                continue
+            if src == 'admin':
                 add_flag(
-                    'call_during_week_off', 'high',
-                    f"CALL DURING WEEK OFF: {call_name} on call "
-                    f"{dt.strftime('%b %-d')} during requested week off {lbl} "
-                    f"(rank #{info['rank']}) — exec decision required.",
+                    'call_during_admin_week', 'high',
+                    f"CALL IN ADMIN WEEK: {call_name} on call "
+                    f"{dt.strftime('%b %-d')} during an admin week ({lbl}) — "
+                    f"that week is meant to hold no call.",
                     surgeon=call_name, date=dt.strftime('%Y-%m-%d'),
-                    week=lbl, rank=info['rank'], is_holiday=info['is_holiday'])
+                    week=lbl, rank=info['rank'], is_holiday=False)
+                continue
+            add_flag(
+                'call_during_week_off', 'high',
+                f"CALL DURING WEEK OFF: {call_name} on call "
+                f"{dt.strftime('%b %-d')} during requested week off {lbl} "
+                f"(rank #{info['rank']}) — exec decision required.",
+                surgeon=call_name, date=dt.strftime('%Y-%m-%d'),
+                week=lbl, rank=info['rank'], is_holiday=info['is_holiday'])
 
     return {
         'violations':           violations,
